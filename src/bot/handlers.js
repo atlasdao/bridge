@@ -2,11 +2,14 @@ const { Markup } = require('telegraf');
 const config = require('../core/config');
 const depixApiService = require('../services/depixApiService');
 
+// Função de escape MarkdownV2 (essencial)
 const escapeMarkdownV2 = (text) => {
     if (typeof text !== 'string') return '';
+    // Escapa os seguintes caracteres: _ * [ ] ( ) ~ ` > # + - = | { } . !
     return text.replace(/([_*\[\]()~`>#+\-=|{}.!])/g, '\\$1');
 };
-module.exports.escapeMarkdownV2 = escapeMarkdownV2;
+// Exportar para que outros módulos (como webhookRoutes) possam usar se necessário
+// module.exports.escapeMarkdownV2 = escapeMarkdownV2; // Será exportado no final junto com registerBotHandlers
 
 const isValidLiquidAddress = (address) => {
     if (!address || typeof address !== 'string') return false;
@@ -16,22 +19,24 @@ const isValidLiquidAddress = (address) => {
     const currentLength = trimmedAddress.length;
     const isValidLength = currentLength > 40 && currentLength < 110; 
     const result = (nonConfidentialMainnet || confidentialMainnet) && isValidLength;
-    // console.log(`[isValidLiquidAddress] Validation for "${trimmedAddress.substring(0,30)}...": ${result} (PrefixOK: ${nonConfidentialMainnet || confidentialMainnet}, LengthOK: ${isValidLength}, Length: ${currentLength})`);
+    // ***** LOG DE DEPURAÇÃO DETALHADO DESCOMENTADO *****
+    console.log(`[isValidLiquidAddress] Input: "${address}", Trimmed: "${trimmedAddress}", StartsEx1/Lq1: ${nonConfidentialMainnet}, StartsVJL/VTj: ${confidentialMainnet}, Length: ${currentLength}, IsValidLength: ${isValidLength}, FinalResult: ${result}`);
     return result;
 };
 
+// Objeto para armazenar { userId: { type: 'estado', messageIdToEdit?: number } } 
 let awaitingInputForUser = {}; 
 
 const registerBotHandlers = (bot, dbPool, expectationMessageQueue) => { 
     const logError = (handlerName, error, ctx) => {
         const userId = ctx?.from?.id || 'N/A';
         console.error(`Error in ${handlerName} for user ${userId}:`, error.message);
-        if (error.response && error.on) {
+        if (error.response && error.on) { // Telegraf error
             console.error('TelegramError details:', JSON.stringify({ response: error.response, on: error.on }, null, 2));
-        } else if (error.response) { 
+        } else if (error.response && error.response.data) { // Axios error (API DePix)
              console.error(`Axios Error Status: ${error.response.status}`);
              console.error('Axios Error Data:', JSON.stringify(error.response.data));
-        } else if (error.stack) {
+        } else if (error.stack) { // Other JS errors
             console.error(error.stack);
         }
     };
@@ -45,14 +50,14 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue) => {
 
     const sendMainMenu = async (ctx, messageText = 'O que você gostaria de fazer hoje?') => {
         try {
-            if (ctx.callbackQuery && ctx.callbackQuery.message) {
+            if (ctx.callbackQuery && ctx.callbackQuery.message && ctx.callbackQuery.message.message_id) {
                 await ctx.editMessageText(messageText, { reply_markup: mainMenuKeyboardObj.reply_markup });
             } else {
                 await ctx.reply(messageText, mainMenuKeyboardObj);
             }
         } catch (error) {
             logError('sendMainMenu/editOrReply', error, ctx);
-            await ctx.reply(messageText, mainMenuKeyboardObj);
+            await ctx.reply(messageText, mainMenuKeyboardObj); // Fallback
         }
     };
     
@@ -63,7 +68,9 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue) => {
         [Markup.button.url('💬 Comunidade Atlas', config.links.communityGroup)]
     ]);
 
-    const clearUserState = (userId) => { delete awaitingInputForUser[userId]; };
+    const clearUserState = (userId) => { 
+        if (userId) delete awaitingInputForUser[userId];
+    };
     
     bot.start(async (ctx) => {
         clearUserState(ctx.from.id);
@@ -80,24 +87,40 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue) => {
                 if (rows.length === 0) {
                     await dbPool.query('INSERT INTO users (telegram_user_id, telegram_username) VALUES ($1, $2) ON CONFLICT (telegram_user_id) DO NOTHING', [telegramUserId, telegramUsername]);
                     console.log(`User ${telegramUserId} (${telegramUsername}) newly registered in DB (no address yet).`);
-                } else if ((rows.length > 0 && !rows[0].telegram_username && telegramUsername !== 'N/A') || (rows.length > 0 && rows[0].telegram_username !== telegramUsername)) { 
+                } else if ((rows[0] && !rows[0].telegram_username && telegramUsername !== 'N/A') || (rows[0] && rows[0].telegram_username !== telegramUsername)) { 
                     await dbPool.query('UPDATE users SET telegram_username = $1, updated_at = NOW() WHERE telegram_user_id = $2', [telegramUsername, telegramUserId]);
                     console.log(`User ${telegramUserId} username updated to ${telegramUsername}.`);
                 }
             }
-        } catch (error) { logError('/start', error, ctx); /* ... fallback ... */ }
+        } catch (error) { 
+            logError('/start', error, ctx); 
+            try {
+                await ctx.reply('Ocorreu um erro ao iniciar. Tente /start novamente.');
+            } catch (e) { logError('/start fallback reply', e, ctx); }
+        }
     });
 
     bot.action('ask_liquid_address', async (ctx) => {
         try {
             clearUserState(ctx.from.id); 
-            awaitingInputForUser[ctx.from.id] = { type: 'liquid_address_initial' };
-            await ctx.answerCbQuery();
             const message = 'Por favor, digite ou cole o **endereço público da sua carteira Liquid** onde você deseja receber seus DePix\\.';
+            let sentMessage;
             if (ctx.callbackQuery && ctx.callbackQuery.message) {
-                await ctx.editMessageText(message, { parse_mode: 'MarkdownV2' });
-            } else { await ctx.replyWithMarkdownV2(message); }
-        } catch (error) { logError('ask_liquid_address', error, ctx); /* ... fallback ... */ }
+                sentMessage = await ctx.editMessageText(message, { parse_mode: 'MarkdownV2' });
+            } else { 
+                sentMessage = await ctx.replyWithMarkdownV2(message); 
+            }
+            awaitingInputForUser[ctx.from.id] = { type: 'liquid_address_initial', messageIdToEdit: sentMessage?.message_id || null };
+            await ctx.answerCbQuery();
+        } catch (error) { 
+            logError('ask_liquid_address', error, ctx); 
+            // Se answerCbQuery já foi chamado, não chamar de novo.
+            // Se ctx.editMessageText falhou, pode ser que o callback já tenha expirado.
+            if (!ctx.answered) {
+                try { await ctx.answerCbQuery('Erro ao processar.'); } catch(e){}
+            }
+            await ctx.replyWithMarkdownV2('Por favor, digite ou cole o **endereço público da sua carteira Liquid**\\.');
+        }
     });
 
     bot.action('explain_liquid_wallet', async (ctx) => {
@@ -114,7 +137,10 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue) => {
             if (ctx.callbackQuery && ctx.callbackQuery.message) {
                 await ctx.editMessageText(message, { parse_mode: 'MarkdownV2', reply_markup: keyboard.reply_markup });
             } else { await ctx.replyWithMarkdownV2(message, keyboard); }
-        } catch (error) { logError('explain_liquid_wallet', error, ctx); /* ... fallback ... */ }
+        } catch (error) { 
+            logError('explain_liquid_wallet', error, ctx); 
+            await ctx.replyWithMarkdownV2("Ocorreu um erro ao mostrar a ajuda da carteira. Tente o menu /start.");
+        }
     });
 
     bot.action('back_to_start_config', async (ctx) => {
@@ -125,7 +151,10 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue) => {
             if (ctx.callbackQuery && ctx.callbackQuery.message) {
                 await ctx.editMessageText(messageText, { reply_markup: initialConfigKeyboardObj.reply_markup });
             } else { await ctx.reply(messageText, initialConfigKeyboardObj); }
-        } catch (error) { logError('back_to_start_config', error, ctx); /* ... fallback ... */ }
+        } catch (error) { 
+            logError('back_to_start_config', error, ctx); 
+            await ctx.reply(`Para receber seus DePix, precisamos saber o endereço da sua carteira Liquid. Você já tem uma?`, initialConfigKeyboardObj);
+        }
     });
 
     bot.on('text', async (ctx) => {
@@ -141,26 +170,31 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue) => {
             const amount = parseFloat(text.replace(',', '.')); 
             if (!isNaN(amount) && amount >= 1 && amount <= 5000) {
                 console.log(`Received amount ${amount} for deposit from user ${telegramUserId}`);
-                let loadingMessage;
+                let loadingMessageContext = ctx; // Contexto para editar ou responder
+                let messageIdToUpdate = userState.messageIdToEdit;
+
                 try {
-                    if (userState.messageIdToEdit) {
-                        await ctx.telegram.editMessageText(ctx.chat.id, userState.messageIdToEdit, undefined, 'Verificando status do serviço DePix, um momento...');
-                    } else { loadingMessage = await ctx.reply('Verificando status do serviço DePix, um momento...'); }
+                    if (messageIdToUpdate) {
+                        await ctx.telegram.editMessageText(ctx.chat.id, messageIdToUpdate, undefined, 'Verificando status do serviço DePix, um momento...');
+                    } else { 
+                        const sentMsg = await ctx.reply('Verificando status do serviço DePix, um momento...');
+                        messageIdToUpdate = sentMsg.message_id; // Guardar para futuras edições
+                    }
                     
                     const isDePixHealthy = await depixApiService.ping();
-                    if (!isDePixHealthy) { clearUserState(telegramUserId); await ctx.reply('O serviço DePix parece estar instável ou indisponível no momento. Por favor, tente novamente mais tarde.'); return; }
-                    
-                    clearUserState(telegramUserId); 
-
+                    if (!isDePixHealthy) { clearUserState(telegramUserId); await ctx.telegram.editMessageText(ctx.chat.id, messageIdToUpdate, undefined, 'O serviço DePix parece estar instável ou indisponível no momento. Por favor, tente novamente mais tarde.'); return; }
+                                        
                     const userResult = await dbPool.query('SELECT liquid_address FROM users WHERE telegram_user_id = $1', [telegramUserId]);
-                    if (!userResult.rows.length || !userResult.rows[0].liquid_address || userResult.rows[0].liquid_address.trim() === '') { await ctx.replyWithMarkdownV2('Não consegui encontrar sua carteira Liquid associada\\. Por favor, use o comando /start para configurar novamente\\.'); return; }
+                    if (!userResult.rows.length || !userResult.rows[0].liquid_address || userResult.rows[0].liquid_address.trim() === '') { 
+                        clearUserState(telegramUserId);
+                        await ctx.telegram.editMessageText(ctx.chat.id, messageIdToUpdate, undefined, 'Não consegui encontrar sua carteira Liquid associada. Por favor, use o comando /start para configurar novamente.');
+                        return; 
+                    }
                     
                     const userLiquidAddress = userResult.rows[0].liquid_address;
                     const amountInCents = Math.round(amount * 100);
 
-                    if (userState.messageIdToEdit) { await ctx.telegram.editMessageText(ctx.chat.id, userState.messageIdToEdit, undefined, 'Gerando seu QR Code Pix, aguarde um momento...'); }
-                    else if (loadingMessage) { await ctx.telegram.editMessageText(ctx.chat.id, loadingMessage.message_id, undefined, 'Gerando seu QR Code Pix, aguarde um momento...');}
-                    else { await ctx.reply('Gerando seu QR Code Pix, aguarde um momento...');  }
+                    await ctx.telegram.editMessageText(ctx.chat.id, messageIdToUpdate, undefined, 'Gerando seu QR Code Pix, aguarde um momento...');
 
                     const pixData = await depixApiService.generatePixForDeposit(amountInCents, userLiquidAddress);
                     const { qrCopyPaste, qrImageUrl, id: depixApiEntryId } = pixData;
@@ -172,29 +206,56 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue) => {
                     console.log(`Transaction ${internalTxId} for BRL ${requestedBrlAmount.toFixed(2)} saved. DePix API ID: ${depixApiEntryId}`);
 
                     const jobId = `expectation-${depixApiEntryId}`;
-                    await expectationMessageQueue.add(jobId, { telegramUserId, depixApiEntryId, supportContact: config.links.supportContact }, { delay: 70 * 1000, removeOnComplete: true, removeOnFail: 5, jobId: jobId });
+                    await expectationMessageQueue.add(jobId, { telegramUserId, depixApiEntryId, supportContact: escapeMarkdownV2(config.links.supportContact) }, { delay: 70 * 1000, removeOnComplete: true, removeOnFail: 5, jobId: jobId });
                     console.log(`Job ${jobId} added for user ${telegramUserId}`);
 
                     let caption = `Pronto\\! Apresente este QRCode Pix ou o código abaixo para o pagador:\n\n`;
                     caption += `Código Pix Copia e Cola:\n\`${escapeMarkdownV2(qrCopyPaste)}\`\n\n`; 
                     caption += `Você receberá aproximadamente \`${depixAmountExpected}\` DePix \\(reais\\) diretamente em sua carteira Liquid assim que o pagamento for confirmado\\. Avisaremos você\\.`;
+                    
+                    // Deletar a mensagem "Gerando..." e enviar a foto
+                    await ctx.telegram.deleteMessage(ctx.chat.id, messageIdToUpdate);
                     await ctx.replyWithPhoto(qrImageUrl, { caption: caption, parse_mode: 'MarkdownV2' });
+                    clearUserState(telegramUserId); // Limpar estado após sucesso
 
-                } catch (apiError) { clearUserState(telegramUserId); logError('generate_pix_api_call_or_ping', apiError, ctx); await ctx.reply(`Desculpe, ocorreu um problema ao gerar o QR Code: ${apiError.message}`); }
-            } else { /* ... (mensagem de valor inválido) ... */ }
+                } catch (apiError) { 
+                    clearUserState(telegramUserId); 
+                    logError('generate_pix_api_call_or_ping', apiError, ctx); 
+                    const errorReply = `Desculpe, ocorreu um problema ao gerar o QR Code: ${apiError.message}`;
+                    if (messageIdToUpdate) { await ctx.telegram.editMessageText(ctx.chat.id, messageIdToUpdate, undefined, errorReply); }
+                    else { await ctx.reply(errorReply); }
+                }
+            } else { 
+                let eMessage = `Valor inválido ou fora dos limites: \`${escapeMarkdownV2(text)}\`\\. `
+                eMessage += `Por favor, envie um valor entre R\\$ 1\\.00 e R\\$ 5000\\.00 \\(ex: \`50.21\`\\)\\.`;
+                if (amount > 5000) { eMessage += `\nPara valores maiores que R\\$ 5000\\.00, contate o suporte: ${escapeMarkdownV2(config.links.supportContact)}`; }
+                await ctx.replyWithMarkdownV2(eMessage);
+                // Manter o estado para permitir nova tentativa
+            }
         } else if (userState && (userState.type === 'liquid_address_initial' || userState.type === 'liquid_address_change')) {
             if (isValidLiquidAddress(text)) {
                 try {
                     await dbPool.query('INSERT INTO users (telegram_user_id, telegram_username, liquid_address, updated_at) VALUES ($1, $2, $3, NOW()) ON CONFLICT (telegram_user_id) DO UPDATE SET liquid_address = EXCLUDED.liquid_address, telegram_username = EXCLUDED.telegram_username, updated_at = NOW()', [telegramUserId, telegramUsername, text]);
-                    clearUserState(telegramUserId); 
                     console.log(`User ${telegramUserId} associated/updated Liquid address: ${text}`);
                     const successMessage = 'Endereço Liquid associado com sucesso!';
                     if (userState.messageIdToEdit) { await ctx.telegram.editMessageText(ctx.chat.id, userState.messageIdToEdit, undefined, successMessage); }
                     else { await ctx.reply(successMessage); }
+                    clearUserState(telegramUserId); 
                     await sendMainMenu(ctx);
-                } catch (error) { logError('text_handler (save_address)', error, ctx); /* ... fallback ... */ }
-            } else { /* ... (mensagem de endereço inválido) ... */ }
-        } else { /* ... (log de texto não manipulado) ... */ }
+                } catch (error) { 
+                    logError('text_handler (save_address)', error, ctx); 
+                    await ctx.reply('Ocorreu um erro ao salvar seu endereço Liquid. Tente novamente.');
+                }
+            } else { 
+                const invalidAddressMessage = `O endereço fornecido não parece ser uma carteira Liquid válida\\. \nVerifique o formato \\(deve começar com \`ex1\`, \`lq1\`, \`VJL\` ou \`VTj\` e ter o comprimento correto\\) e tente novamente\\. \n\nOu, se precisar de ajuda para criar uma:`;
+                await ctx.replyWithMarkdownV2(invalidAddressMessage, Markup.inlineKeyboard([[Markup.button.callback('❌ Preciso de Ajuda com Carteira', 'explain_liquid_wallet')]]));
+                // Manter o estado para permitir nova tentativa
+            }
+        } else {
+            console.log(`[INFO] Unhandled text from user ${telegramUserId} ("${text.substring(0,20)}...") in state: ${JSON.stringify(userState)}`);
+            // Opcional: Responder a texto não esperado
+            // await ctx.reply("Não entendi. Use os botões ou comandos disponíveis, ou digite /start para recomeçar.");
+        }
     });
 
     bot.action('receive_pix_start', async (ctx) => {
@@ -214,7 +275,10 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue) => {
             if (ctx.callbackQuery && ctx.callbackQuery.message) { sentMessage = await ctx.editMessageText(amountRequestMessage, { parse_mode: 'MarkdownV2' }); }
             else { sentMessage = await ctx.replyWithMarkdownV2(amountRequestMessage); }
             awaitingInputForUser[ctx.from.id] = { type: 'amount', messageIdToEdit: sentMessage?.message_id || null };
-        } catch (error) { logError('receive_pix_start', error, ctx); /* ... fallback ... */ }
+        } catch (error) { 
+            logError('receive_pix_start', error, ctx); 
+            await ctx.reply("Ocorreu um erro. Tente o menu /start.");
+        }
     });
 
     bot.action('my_wallet', async (ctx) => {
@@ -231,8 +295,16 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue) => {
                        [Markup.button.callback('⬅️ Voltar ao Menu', 'back_to_main_menu')]]);
                 if (ctx.callbackQuery && ctx.callbackQuery.message) { await ctx.editMessageText(message, { parse_mode: 'MarkdownV2', reply_markup: keyboard.reply_markup }); }
                 else { await ctx.replyWithMarkdownV2(message, keyboard); }
-            } else { /* ... (carteira não associada) ... */ }
-        } catch (error) { logError('my_wallet', error, ctx); /* ... fallback ... */ }
+            } else { 
+                const message = 'Você ainda não associou uma carteira Liquid\\. Configure uma primeiro usando o botão abaixo ou o comando /start\\.';
+                const keyboard = Markup.inlineKeyboard([[Markup.button.callback('✅ Associar Carteira Liquid', 'ask_liquid_address')]]);
+                if (ctx.callbackQuery && ctx.callbackQuery.message) { await ctx.editMessageText(message, {parse_mode: 'MarkdownV2', reply_markup: keyboard.reply_markup});}
+                else { await ctx.replyWithMarkdownV2(message, keyboard);}
+            }
+        } catch (error) { 
+            logError('my_wallet', error, ctx); 
+            if (ctx.callbackQuery && ctx.callbackQuery.message && error.message && !error.message.includes("message is not modified")){ await ctx.reply('Ocorreu um erro ao buscar sua carteira.');}
+        }
     });
 
     bot.action('change_wallet_start', async (ctx) => {
@@ -243,7 +315,10 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue) => {
             if (ctx.callbackQuery && ctx.callbackQuery.message) { sentMessage = await ctx.editMessageText(message, { parse_mode: 'MarkdownV2' });}
             else { sentMessage = await ctx.replyWithMarkdownV2(message); }
             awaitingInputForUser[ctx.from.id] = { type: 'liquid_address_change', messageIdToEdit: sentMessage?.message_id || null };
-        } catch (error) { logError('change_wallet_start', error, ctx); /* ... fallback ... */ }
+        } catch (error) { 
+            logError('change_wallet_start', error, ctx); 
+            await ctx.reply('Ocorreu um erro. Tente novamente.');
+        }
     });
     
     const TRANSACTIONS_PER_PAGE = 5;
@@ -260,23 +335,18 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue) => {
             const totalTransactions = parseInt(countResult[0].total, 10);
             const totalPages = Math.ceil(totalTransactions / TRANSACTIONS_PER_PAGE);
 
-            // CORREÇÃO AQUI: Escapar o título
             let message = `**Seu Histórico de Transações \\(Pix \\-\\> DePix\\)**\n\n`;
             if (transactions.length === 0) {
                 message += 'Nenhuma transação encontrada\\. Comece recebendo um Pix\\!';
             } else {
                 transactions.forEach(tx => {
-                    // Formatar data e escapar para MarkdownV2
                     const date = escapeMarkdownV2(new Date(tx.created_at).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'America/Sao_Paulo' }));
                     const statusEmoji = tx.payment_status === 'PAID' ? '✅' : (tx.payment_status === 'PENDING' ? '⏳' : '❌');
-                    
-                    message += `${statusEmoji} *${date}*\n`; // Data já escapada, não precisa de mais escapes aqui se for só texto
+                    message += `${statusEmoji} *${date}*\n`;
                     message += `   Valor: R\\$ ${escapeMarkdownV2(Number(tx.requested_brl_amount).toFixed(2))}\n`;
                     message += `   Status: ${escapeMarkdownV2(tx.payment_status)}\n`;
-                    if (tx.depix_txid) {
-                        message += `   Liquid TXID: \`${escapeMarkdownV2(tx.depix_txid.substring(0,10))}...\`\n`; // Conteúdo de ` ` não é interpretado
-                    }
-                    message += `   ID Interno: \`${escapeMarkdownV2(tx.transaction_id.substring(0,8))}\`\n\n`; // Conteúdo de ` ` não é interpretado
+                    if (tx.depix_txid) { message += `   Liquid TXID: \`${escapeMarkdownV2(tx.depix_txid.substring(0,10))}...\`\n`; }
+                    message += `   ID Interno: \`${escapeMarkdownV2(tx.transaction_id.substring(0,8))}\`\n\n`;
                 });
             }
 
@@ -291,7 +361,10 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue) => {
             if (ctx.callbackQuery && ctx.callbackQuery.message) {
                 await ctx.editMessageText(message, { parse_mode: 'MarkdownV2', reply_markup: Markup.inlineKeyboard(keyboardButtons).reply_markup, disable_web_page_preview: true });
             } else { await ctx.replyWithMarkdownV2(message, Markup.inlineKeyboard(keyboardButtons)); }
-        } catch (error) { logError('transaction_history', error, ctx); /* ... fallback ... */ }
+        } catch (error) { 
+            logError('transaction_history', error, ctx); 
+            await ctx.reply('Ocorreu um erro ao buscar seu histórico.');
+        }
     });
     
     bot.action('back_to_main_menu', async (ctx) => {
@@ -299,7 +372,10 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue) => {
             clearUserState(ctx.from.id); 
             await ctx.answerCbQuery();
             await sendMainMenu(ctx);
-        } catch (error) { logError('back_to_main_menu', error, ctx); /* ... fallback ... */ }
+        } catch (error) { 
+            logError('back_to_main_menu', error, ctx); 
+            await ctx.reply('Ocorreu um erro ao voltar ao menu. Tente /start.');
+        }
     });
 
     bot.action('about_bridge', async (ctx) => {
@@ -316,10 +392,25 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue) => {
             const keyboard = Markup.inlineKeyboard([[Markup.button.callback('⬅️ Voltar ao Menu', 'back_to_main_menu')]]);
             if (ctx.callbackQuery && ctx.callbackQuery.message) { await ctx.editMessageText(aboutMessage, { parse_mode: 'MarkdownV2', reply_markup: keyboard.reply_markup });}
             else { await ctx.replyWithMarkdownV2(aboutMessage, keyboard); }
-        } catch (error) { logError('about_bridge', error, ctx); /* ... fallback ... */ }
+        } catch (error) { 
+            logError('about_bridge', error, ctx); 
+            await ctx.replyWithMarkdownV2('Ocorreu um erro ao mostrar as informações\\. Tente o menu /start\\.');
+        }
     });
 
-    bot.catch((err, ctx) => { /* ... (código existente) ... */ });
+    bot.catch((err, ctx) => { 
+        logError('Global Telegraf bot.catch', err, ctx);
+        if (ctx && err.message && (err.message.includes("query is too old") || err.message.includes("message is not modified"))) {
+            return; 
+        }
+        if (ctx && ctx.chat && ctx.chat.id) { // Garante que temos um chat para enviar a mensagem
+            try {
+                 ctx.telegram.sendMessage(ctx.chat.id, 'Desculpe, ocorreu um erro inesperado. Por favor, tente o comando /start novamente ou contate o suporte.');
+            } catch (replyError) {
+                logError('Global bot.catch sendMessage fallback', replyError, ctx);
+            }
+        }
+    });
     console.log('Bot handlers registered.');
 };
 
