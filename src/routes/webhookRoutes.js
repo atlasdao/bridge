@@ -1,8 +1,8 @@
 const express = require('express');
 const crypto = require('crypto');
+const { Markup } = require('telegraf'); // Importar Markup para criar botões
 const config = require('../core/config');
-const { QUEUE_NAME } = require('../queues/expectationMessageQueue'); // Re-adicionado se você usa para job ID, senão pode remover
-const { escapeMarkdownV2 } = require('../bot/handlers'); 
+const { escapeMarkdownV2 } = require('../bot/handlers'); // Importar a função de escape
 
 const safeCompare = (a, b) => {
     if (typeof a !== 'string' || typeof b !== 'string') { return false; }
@@ -19,7 +19,7 @@ const createWebhookRoutes = (dbPool, expectationMessageQueue) => {
 
     router.post('/depix_payment', async (req, res) => {
         console.log('Received DePix Webhook POST request.');
-        console.log('Webhook Raw Headers:', JSON.stringify(req.headers, null, 2)); // Log completo dos headers
+        console.log('Webhook Raw Headers:', JSON.stringify(req.headers, null, 2));
         console.log('Webhook Body:', JSON.stringify(req.body, null, 2));
 
         const authHeader = req.headers.authorization;
@@ -97,18 +97,40 @@ const createWebhookRoutes = (dbPool, expectationMessageQueue) => {
                                       `Status da API DePix: ${escapeMarkdownV2(status)}\\. Se o valor foi debitado, entre em contato com o suporte\\.`;
                     }
                     try {
-                        console.log(`Attempting to send notification to ${recipientTelegramUserId}: "${userMessage.substring(0, 150)}..." (Full length: ${userMessage.length})`);
+                        console.log(`Attempting to send notification to ${recipientTelegramUserId}: "${userMessage.substring(0, 150)}..."`);
                         await botInstance.telegram.sendMessage(recipientTelegramUserId, userMessage, { parse_mode: 'MarkdownV2' });
                         console.log(`Notification SENT to user ${recipientTelegramUserId} for transaction ${ourTransactionId}`);
+
+                        // ***** NOVA FUNCIONALIDADE: Mensagem de Feedback (se o pagamento foi um sucesso) *****
+                        if (newPaymentStatus === 'PAID') {
+                            const feedbackMessage = "Gostou da experiência? Conte para nós em nossa comunidade! Seu feedback é muito importante para o desenvolvimento do Atlas Bridge.";
+                            const feedbackLink = "https://t.me/c/2573281169/3";
+                            
+                            setTimeout(async () => {
+                                try {
+                                    await botInstance.telegram.sendMessage(
+                                        recipientTelegramUserId,
+                                        feedbackMessage,
+                                        Markup.inlineKeyboard([
+                                            [Markup.button.url('Deixar Feedback na Comunidade', feedbackLink)]
+                                        ])
+                                    );
+                                    console.log(`Feedback request sent to user ${recipientTelegramUserId}.`);
+                                } catch (feedbackError) {
+                                    console.error(`FAILED to send feedback request to user ${recipientTelegramUserId}. Error: ${feedbackError.message}`);
+                                }
+                            }, 2000); // Delay de 2 segundos
+                        }
+
                     } catch (notifyError) {
                         console.error(`FAILED to send Telegram notification to user ${recipientTelegramUserId}. Error: ${notifyError.message}`);
-                        if (notifyError.response && notifyError.on) { // Detalhes do TelegramError
+                        if (notifyError.response && notifyError.on) {
                              console.error('[Webhook Notify TelegramError details]:', JSON.stringify({ 
                                 response: notifyError.response, 
                                 on: notifyError.on,
-                                attempted_message_payload: { text: userMessage, parse_mode: 'MarkdownV2' } // Logar o payload exato
+                                attempted_message_payload: { text: userMessage, parse_mode: 'MarkdownV2' } 
                             }, null, 2));
-                        } else { // Outros erros
+                        } else {
                             console.error(notifyError.stack);
                         }
                     }
