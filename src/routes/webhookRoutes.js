@@ -103,8 +103,8 @@ const createWebhookRoutes = (dbPool, expectationMessageQueue) => {
 
                         // ***** Update: Solicitação de doação. *****
                         if (newPaymentStatus === 'PAID') {
-                            const feedbackMessage = "O bot está te ajudando? Não estamos conseguindo cobrir os custos de infraestrutura, considere fazer uma doação para manter o bot no ar e financiar o desenvolvimento contínuo. Envie Depix para:";
-                            const feedbackLink = "VJLBCUaw6GL8AuyjsrwpwTYNCUfUxPVTfxxffNTEZMKEjSwamWL6YqUUWLvz89ts1scTDKYoTF8oruMX";
+                            const feedbackMessage = "O bot está te ajudando? Não estamos conseguindo cobrir os custos de infraestrutura, considere fazer uma doação para manter o bot no ar e financiar o desenvolvimento contínuo. Envie Depix para: \n\n VJLBCUaw6GL8AuyjsrwpwTYNCUfUxPVTfxxffNTEZMKEjSwamWL6YqUUWLvz89ts1scTDKYoTF8oruMX";
+                            const feedbackLink = "https://coinos.io/AtlasDAO";
                             
                             setTimeout(async () => {
                                 try {
@@ -112,12 +112,12 @@ const createWebhookRoutes = (dbPool, expectationMessageQueue) => {
                                         recipientTelegramUserId,
                                         feedbackMessage,
                                         Markup.inlineKeyboard([
-                                            [Markup.button.url('Deixar Feedback na Comunidade', feedbackLink)]
+                                            [Markup.button.url('Ou, clique aqui para doar BTC lightning, On-chain ou Liquid', feedbackLink)]
                                         ])
                                     );
-                                    console.log(`Feedback request sent to user ${recipientTelegramUserId}.`);
+                                    console.log(`Donation request sent to user ${recipientTelegramUserId}.`);
                                 } catch (feedbackError) {
-                                    console.error(`FAILED to send feedback request to user ${recipientTelegramUserId}. Error: ${feedbackError.message}`);
+                                    console.error(`FAILED to send donation request to user ${recipientTelegramUserId}. Error: ${feedbackError.message}`);
                                 }
                             }, 2000); // Delay de 2 segundos
                         }
