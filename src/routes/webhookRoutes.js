@@ -101,10 +101,10 @@ const createWebhookRoutes = (dbPool, expectationMessageQueue) => {
                         await botInstance.telegram.sendMessage(recipientTelegramUserId, userMessage, { parse_mode: 'MarkdownV2' });
                         console.log(`Notification SENT to user ${recipientTelegramUserId} for transaction ${ourTransactionId}`);
 
-                        // ***** NOVA FUNCIONALIDADE: Mensagem de Feedback (se o pagamento foi um sucesso) *****
+                        // ***** Update: Solicitação de doação. *****
                         if (newPaymentStatus === 'PAID') {
-                            const feedbackMessage = "Gostou da experiência? Conte para nós em nossa comunidade! Seu feedback é muito importante para o desenvolvimento do Atlas Bridge.";
-                            const feedbackLink = "https://t.me/c/2573281169/3";
+                            const feedbackMessage = "O bot está te ajudando? Não estamos conseguindo cobrir os custos de infraestrutura, considere fazer uma doação para manter o bot no ar e financiar o desenvolvimento contínuo. Envie Depix para:";
+                            const feedbackLink = "VJLBCUaw6GL8AuyjsrwpwTYNCUfUxPVTfxxffNTEZMKEjSwamWL6YqUUWLvz89ts1scTDKYoTF8oruMX";
                             
                             setTimeout(async () => {
                                 try {
