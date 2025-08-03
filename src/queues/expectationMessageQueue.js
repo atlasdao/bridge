@@ -1,7 +1,6 @@
 const { Queue, Worker } = require('bullmq');
 const IORedis = require('ioredis');
 const config = require('../core/config');
-// Importar a função de escape diretamente do módulo handlers
 const { escapeMarkdownV2 } = require('../bot/handlers');
 
 
@@ -24,10 +23,10 @@ console.log(`BullMQ Queue "${QUEUE_NAME}" initialized.`);
 const initializeExpectationWorker = (dbPool, botInstanceGetter) => {
     console.log(`Initializing BullMQ Worker for queue: ${QUEUE_NAME}`);
     const worker = new Worker(QUEUE_NAME, async (job) => {
-        const { telegramUserId, depixApiEntryId, supportContact } = job.data; // supportContact já vem escapado do handlers.js
+        const { telegramUserId, depixApiEntryId, supportContact } = job.data;
         const bot = botInstanceGetter(); 
 
-        if (!bot) { /* ... (erro) ... */ throw new Error('Bot instance not available for worker.'); }
+        if (!bot) { throw new Error('Bot instance not available for worker.'); }
         console.log(`[Worker ${QUEUE_NAME}] Processing job ${job.id} for user ${telegramUserId}, depixEntryId ${depixApiEntryId}`);
 
         try {
@@ -36,15 +35,25 @@ const initializeExpectationWorker = (dbPool, botInstanceGetter) => {
             if (rows.length > 0 && rows[0].payment_status === 'PENDING') {
                 console.log(`[Worker ${QUEUE_NAME}] Transaction ${depixApiEntryId} still PENDING. Sending expectation message.`);
                 
-                // MENSAGEM DE EXPECTATIVA ATUALIZADA E JÁ USA supportContact escapado
                 const message = 
                     `Lembrete: Após o pagamento do Pix, seus DePix podem levar alguns instantes \\(geralmente até 2 minutos\\) para serem creditados em sua carteira Liquid\\.\n\n` +
-                    `Se você já pagou e está aguardando, um pouco mais de paciência\\! Se houver qualquer problema ou demora excessiva, contate nosso suporte: ${supportContact}`; // supportContact foi passado já escapado
+                    `Se você já pagou e está aguardando, um pouco mais de paciência\\! Se houver qualquer problema ou demora excessiva, contate nosso suporte: ${supportContact}`;
                 
-                await bot.telegram.sendMessage( telegramUserId, message, { parse_mode: 'MarkdownV2' } ); // Não precisa mais escapar aqui
+                const sentMessage = await bot.telegram.sendMessage( telegramUserId, message, { parse_mode: 'MarkdownV2' } );
+                
+                // SALVAR O ID DA MENSAGEM DE LEMBRETE
+                if (sentMessage && sentMessage.message_id) {
+                    await dbPool.query('UPDATE pix_transactions SET reminder_message_id = $1 WHERE depix_api_entry_id = $2', [sentMessage.message_id, depixApiEntryId]);
+                    console.log(`[Worker ${QUEUE_NAME}] Stored reminder_message_id ${sentMessage.message_id} for ${depixApiEntryId}.`);
+                }
+
                 console.log(`[Worker ${QUEUE_NAME}] Expectation message sent to user ${telegramUserId} for ${depixApiEntryId}.`);
-            } else if (rows.length > 0) { /* ... (log) ... */ }
-            else { /* ... (log) ... */ }
+            } else if (rows.length > 0) {
+                console.log(`[Worker ${QUEUE_NAME}] Transaction ${depixApiEntryId} is no longer PENDING (status: ${rows[0].payment_status}). Reminder message was not sent.`);
+            }
+            else { 
+                console.warn(`[Worker ${QUEUE_NAME}] Transaction with depix_api_entry_id ${depixApiEntryId} not found while trying to send reminder.`);
+            }
         } catch (error) { console.error(`[Worker ${QUEUE_NAME}] Error processing job ${job.id}:`, error); throw error; }
     }, { connection });
 

@@ -1,8 +1,8 @@
 const express = require('express');
 const crypto = require('crypto');
-const { Markup } = require('telegraf'); // Importar Markup para criar botões
+const { Markup } = require('telegraf');
 const config = require('../core/config');
-const { escapeMarkdownV2 } = require('../bot/handlers'); // Importar a função de escape
+const { escapeMarkdownV2 } = require('../bot/handlers');
 
 const safeCompare = (a, b) => {
     if (typeof a !== 'string' || typeof b !== 'string') { return false; }
@@ -14,12 +14,11 @@ const safeCompare = (a, b) => {
     } catch (e) { console.error("Error in safeCompare:", e); return false; }
 };
 
-const createWebhookRoutes = (dbPool, expectationMessageQueue) => {
+const createWebhookRoutes = (dbPool, expectationMessageQueue, expirationQueue) => { // Aceitar a nova fila
     const router = express.Router();
 
     router.post('/depix_payment', async (req, res) => {
         console.log('Received DePix Webhook POST request.');
-        console.log('Webhook Raw Headers:', JSON.stringify(req.headers, null, 2));
         console.log('Webhook Body:', JSON.stringify(req.body, null, 2));
 
         const authHeader = req.headers.authorization;
@@ -27,12 +26,10 @@ const createWebhookRoutes = (dbPool, expectationMessageQueue) => {
 
         if (authHeader && authHeader.startsWith('Basic ')) {
             const providedSecret = authHeader.substring(6); 
-            console.log(`Webhook Auth Attempt: Secret from header: "${providedSecret}" (length: ${providedSecret?.length})`);
-            console.log(`Expected Secret from config: "${config.depix.webhookSecret}" (length: ${config.depix.webhookSecret?.length})`);
             if (providedSecret && config.depix.webhookSecret && safeCompare(providedSecret, config.depix.webhookSecret)) {
                 authorized = true;
-            } else { console.warn('Webhook secret mismatch.'); }
-        } else { console.warn('Webhook Authorization header missing or not "Basic " type.'); }
+            }
+        }
 
         if (!authorized) {
             console.warn('WEBHOOK AUTHORIZATION FAILED.');
@@ -48,18 +45,23 @@ const createWebhookRoutes = (dbPool, expectationMessageQueue) => {
             return res.status(400).send('Bad Request: Missing required fields.');
         }
         
-        const jobToRemoveId = `expectation-${qrId}`;
+        // REMOVER JOBS DE AMBAS AS FILAS
+        const reminderJobId = `expectation-${qrId}`;
+        const expirationJobId = `expiration-${qrId}`;
         try {
-            const job = await expectationMessageQueue.getJob(jobToRemoveId);
-            if (job) { await job.remove(); console.log(`Expectation job ${jobToRemoveId} removed for qrId ${qrId}.`);}
-            else { console.log(`No active expectation job ${jobToRemoveId} found for qrId ${qrId}.`); }
-        } catch (queueError) { console.error(`Error removing job ${jobToRemoveId} from BullMQ:`, queueError); }
+            const reminderJob = await expectationMessageQueue.getJob(reminderJobId);
+            if (reminderJob) { await reminderJob.remove(); console.log(`Reminder job ${reminderJobId} removed.`); }
+            
+            const expirationJob = await expirationQueue.getJob(expirationJobId);
+            if (expirationJob) { await expirationJob.remove(); console.log(`Expiration job ${expirationJobId} removed.`); }
+        } catch (queueError) { console.error(`Error removing jobs for qrId ${qrId} from BullMQ:`, queueError); }
 
-        console.log(`Processing webhook for qrId: ${qrId}, status: ${status}, valueInCents: ${valueInCents}, blockchainTxID: ${blockchainTxID || 'N/A'}`);
+        console.log(`Processing webhook for qrId: ${qrId}, status: ${status}`);
 
         try {
+            // BUSCAR OS IDs DAS MENSAGENS JUNTO COM OS OUTROS DADOS
             const { rows } = await dbPool.query(
-                'SELECT transaction_id, user_id, requested_brl_amount FROM pix_transactions WHERE depix_api_entry_id = $1 AND payment_status = $2',
+                'SELECT transaction_id, user_id, requested_brl_amount, qr_code_message_id, reminder_message_id FROM pix_transactions WHERE depix_api_entry_id = $1 AND payment_status = $2',
                 [qrId, 'PENDING']
             );
 
@@ -69,9 +71,7 @@ const createWebhookRoutes = (dbPool, expectationMessageQueue) => {
             }
 
             const transaction = rows[0];
-            const ourTransactionId = transaction.transaction_id;
-            const recipientTelegramUserId = transaction.user_id;
-            const requestedAmountBRL = Number(transaction.requested_brl_amount).toFixed(2); 
+            const { transaction_id: ourTransactionId, user_id: recipientTelegramUserId, requested_brl_amount: requestedAmountBRL, qr_code_message_id: qrMessageId, reminder_message_id: reminderMessageId } = transaction;
 
             let newPaymentStatus;
             if (status === 'depix_sent') { newPaymentStatus = 'PAID'; }
@@ -81,29 +81,37 @@ const createWebhookRoutes = (dbPool, expectationMessageQueue) => {
             
             if (newPaymentStatus === 'PAID' || newPaymentStatus === 'FAILED') {
                 await dbPool.query( 'UPDATE pix_transactions SET payment_status = $1, depix_txid = $2, webhook_received_at = NOW(), updated_at = NOW() WHERE transaction_id = $3', [newPaymentStatus, blockchainTxID, ourTransactionId]);
-                console.log(`Transaction ${ourTransactionId} updated to ${newPaymentStatus} with Liquid TxID ${blockchainTxID || 'N/A'}`);
+                console.log(`Transaction ${ourTransactionId} updated to ${newPaymentStatus}`);
 
                 const botInstance = require('../app').getBotInstance(); 
                 
                 if (botInstance && recipientTelegramUserId) {
+                    // TENTAR APAGAR MENSAGENS ANTERIORES
+                    if (qrMessageId) {
+                        try { await botInstance.telegram.deleteMessage(recipientTelegramUserId, qrMessageId); console.log(`Deleted QR message ${qrMessageId}`); }
+                        catch (e) { console.error(`Failed to delete QR message ${qrMessageId}: ${e.message}`); }
+                    }
+                    if (reminderMessageId) {
+                        try { await botInstance.telegram.deleteMessage(recipientTelegramUserId, reminderMessageId); console.log(`Deleted reminder message ${reminderMessageId}`); }
+                        catch (e) { console.error(`Failed to delete reminder message ${reminderMessageId}: ${e.message}`); }
+                    }
+
                     let userMessage = '';
                     if (newPaymentStatus === 'PAID') {
-                        userMessage = `✅ Pagamento Pix de R\\$ ${escapeMarkdownV2(requestedAmountBRL)} confirmado\\!\n` +
+                        userMessage = `✅ Pagamento Pix de R\\$ ${escapeMarkdownV2(Number(requestedAmountBRL).toFixed(2))} confirmado\\!\n` +
                                       `Seus DePix foram enviados\\.\n`;
                         if (blockchainTxID) { userMessage += `ID da Transação Liquid: \`${escapeMarkdownV2(blockchainTxID)}\``; }
-                        else { userMessage += `ID da Transação Liquid não fornecido no momento\\.`; }
                     } else { 
-                        userMessage = `❌ Falha no pagamento Pix de R\\$ ${escapeMarkdownV2(requestedAmountBRL)}\\.\n` +
+                        userMessage = `❌ Falha no pagamento Pix de R\\$ ${escapeMarkdownV2(Number(requestedAmountBRL).toFixed(2))}\\.\n` +
                                       `Status da API DePix: ${escapeMarkdownV2(status)}\\. Se o valor foi debitado, entre em contato com o suporte\\.`;
                     }
+                    
                     try {
-                        console.log(`Attempting to send notification to ${recipientTelegramUserId}: "${userMessage.substring(0, 150)}..."`);
                         await botInstance.telegram.sendMessage(recipientTelegramUserId, userMessage, { parse_mode: 'MarkdownV2' });
                         console.log(`Notification SENT to user ${recipientTelegramUserId} for transaction ${ourTransactionId}`);
 
-                        // ***** Update:: Solicitação de doação. *****
                         if (newPaymentStatus === 'PAID') {
-                            const feedbackMessage = "O Bot está te ajudando? Não estamos conseguindo cobrir os custos de infraestrutura, considere fazer uma doação para manter o bot no ar e financiar o desenvolvimento contínuo. Envie Depix para: \n\n VJLBCUaw6GL8AuyjsrwpwTYNCUfUxPVTfxxffNTEZMKEjSwamWL6YqUUWLvz89ts1scTDKYoTF8oruMX";
+                            const feedbackMessage = "O bot está te ajudando? Não estamos conseguindo cobrir os custos de infraestrutura, considere fazer uma doação para manter o bot no ar e financiar o desenvolvimento contínuo. Envie Depix para: \n\n VJLBCUaw6GL8AuyjsrwpwTYNCUfUxPVTfxxffNTEZMKEjSwamWL6YqUUWLvz89ts1scTDKYoTF8oruMX";
                             const feedbackLink = "https://coinos.io/AtlasDAO";
                             
                             setTimeout(async () => {
@@ -119,26 +127,15 @@ const createWebhookRoutes = (dbPool, expectationMessageQueue) => {
                                 } catch (feedbackError) {
                                     console.error(`FAILED to send donation request to user ${recipientTelegramUserId}. Error: ${feedbackError.message}`);
                                 }
-                            }, 2000); // Delay de 2 segundos
+                            }, 2000);
                         }
 
                     } catch (notifyError) {
                         console.error(`FAILED to send Telegram notification to user ${recipientTelegramUserId}. Error: ${notifyError.message}`);
-                        if (notifyError.response && notifyError.on) {
-                             console.error('[Webhook Notify TelegramError details]:', JSON.stringify({ 
-                                response: notifyError.response, 
-                                on: notifyError.on,
-                                attempted_message_payload: { text: userMessage, parse_mode: 'MarkdownV2' } 
-                            }, null, 2));
-                        } else {
-                            console.error(notifyError.stack);
-                        }
                     }
                 } else {
                     console.warn(`Notification NOT sent for transaction ${ourTransactionId}: botInstance or recipientTelegramUserId missing.`);
                 }
-            } else {
-                 console.log(`No status change from PENDING for transaction ${ourTransactionId}. Current webhook status: ${status}`);
             }
             res.status(200).send('OK: Webhook processed.');
         } catch (dbError) {

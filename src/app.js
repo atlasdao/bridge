@@ -4,10 +4,11 @@ const express = require('express');
 const { Pool } = require('pg');
 const IORedis = require('ioredis');
 
-// CORREÇÃO NA IMPORTAÇÃO
-const { registerBotHandlers } = require('./bot/handlers'); 
+const { registerBotHandlers } = require('./bot/handlers');
 const { createWebhookRoutes } = require('./routes/webhookRoutes');
 const { initializeExpectationWorker, expectationMessageQueue } = require('./queues/expectationMessageQueue');
+// IMPORTAR A NOVA FILA
+const { initializeExpirationWorker, expirationQueue } = require('./queues/expirationQueue');
 
 console.log('Starting Atlas Bridge Bot...');
 console.log('NODE_ENV:', config.app.nodeEnv);
@@ -19,7 +20,7 @@ const dbPool = new Pool({
 dbPool.query('SELECT NOW() AS now', (err, res) => {
     if (err) {
         console.error('Error connecting to Supabase database:', err.stack);
-        process.exit(1); 
+        process.exit(1);
     } else {
         console.log('Successfully connected to Supabase database. Current time from DB:', res.rows[0].now);
     }
@@ -49,26 +50,30 @@ const getBotInstance = () => {
     }
     return botInstanceInternal;
 };
-module.exports.getBotInstance = getBotInstance; 
+module.exports.getBotInstance = getBotInstance;
 
-registerBotHandlers(bot, dbPool, expectationMessageQueue); 
+// PASSAR A NOVA FILA PARA OS HANDLERS
+registerBotHandlers(bot, dbPool, expectationMessageQueue, expirationQueue);
+// INICIALIZAR O NOVO WORKER
 initializeExpectationWorker(dbPool, getBotInstance);
+initializeExpirationWorker(dbPool, getBotInstance);
 
 bot.launch()
     .then(() => console.log('Telegram Bot started successfully via polling.'))
     .catch(err => {
         console.error('Error starting Telegram Bot:', err);
-        process.exit(1); 
+        process.exit(1);
     });
 
 const app = express();
-app.use(express.json()); 
+app.use(express.json());
 
 app.get('/', (req, res) => {
     res.status(200).send('Atlas Bridge Bot App is alive!');
 });
 
-app.use('/webhooks', createWebhookRoutes(dbPool, expectationMessageQueue)); 
+// PASSAR A NOVA FILA PARA AS ROTAS DE WEBHOOK
+app.use('/webhooks', createWebhookRoutes(dbPool, expectationMessageQueue, expirationQueue));
 
 const server = app.listen(config.app.port, '0.0.0.0', () => {
     console.log(`Express server listening on port ${config.app.port}.`);
@@ -91,9 +96,9 @@ const gracefulShutdown = async (signal) => {
         console.log('Closing BullMQ queue and worker connections...');
         try {
             if (expectationMessageQueue) await expectationMessageQueue.close();
-            // Adicionar fechamento do worker se ele for exportado e tiver método close()
-            console.log('BullMQ queue closed.');
-        } catch(err) { console.error('Error closing BullMQ queue:', err.message); }
+            if (expirationQueue) await expirationQueue.close(); // FECHAR A NOVA FILA
+            console.log('BullMQ queues closed.');
+        } catch(err) { console.error('Error closing BullMQ queues:', err.message); }
 
         console.log('Closing database pool...');
         try {
@@ -122,4 +127,3 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 console.log('Application setup complete. Bot and server are running.');
-
