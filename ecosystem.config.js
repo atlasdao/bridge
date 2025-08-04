@@ -1,6 +1,6 @@
 module.exports = {
   apps : [{
-    name   : "atlas-bridge-prod",
+    name   : "atlas-bridge-PROD",
     script : "./src/app.js",
     env_production: {
       NODE_ENV: "production"
