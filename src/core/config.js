@@ -1,6 +1,5 @@
 const path = require('path');
 
-// Determina qual arquivo .env carregar com base no NODE_ENV
 const nodeEnv = process.env.NODE_ENV || 'development';
 const envPath = path.resolve(__dirname, `../../.env.${nodeEnv}`);
 
@@ -23,8 +22,8 @@ const config = {
     },
     app: {
         baseUrl: process.env.APP_BASE_URL,
-        port: parseInt(process.env.PORT, 10) || 3000,
-        nodeEnv: nodeEnv, // Usa a variável já determinada
+        port: parseInt(process.env.PORT, 10) || (nodeEnv === 'production' ? 3000 : 3001),
+        nodeEnv: nodeEnv,
     },
     tor: {
         socksProxy: process.env.TOR_SOCKS_PROXY,
@@ -33,7 +32,6 @@ const config = {
         host: process.env.REDIS_HOST || '127.0.0.1',
         port: parseInt(process.env.REDIS_PORT, 10) || 6379,
         password: process.env.REDIS_PASSWORD || undefined,
-        // NOVA CONFIGURAÇÃO: DB do Redis para isolamento
         db: parseInt(process.env.REDIS_DB, 10) || 0,
     },
     links: {
@@ -43,7 +41,6 @@ const config = {
     }
 };
 
-// Validação (permanece a mesma)
 const essentialConfigs = {
     'TELEGRAM_BOT_TOKEN': config.telegram.botToken,
     'DEPIX_API_BASE_URL': config.depix.apiBaseUrl,
@@ -67,6 +64,8 @@ if (!config.tor.socksProxy) {
 }
 
 console.log(`Configuration loaded for NODE_ENV: "${config.app.nodeEnv}"`);
+console.log(`Using App Base URL: ${config.app.baseUrl}`);
+console.log(`Using App Port: ${config.app.port}`);
 console.log(`Using Redis DB: ${config.redis.db}`);
 
 module.exports = config;
