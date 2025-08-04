@@ -1,33 +1,22 @@
 module.exports = {
   /**
-   * Lista de aplicações a serem gerenciadas pelo PM2.
-   * Cada objeto no array representa uma aplicação.
+   * Configuração do PM2 EXCLUSIVAMENTE para a aplicação de PRODUÇÃO.
+   * Este arquivo deve viver no diretório raiz da branch 'main'.
    */
   apps : [
-    // --- AMBIENTE DE PRODUÇÃO ---
     {
-      name: "atlas-bridge-PROD",
+      name: "atlas-bridge-prod",
       script: "./src/app.js",
-      // As variáveis de ambiente definidas aqui serão carregadas
-      // apenas quando o PM2 for iniciado com a flag --env production
-      env_production: {
+      
+      // 'watch' é desabilitado em produção para garantir estabilidade.
+      // As atualizações devem ser feitas manualmente com 'pm2 restart'.
+      watch: false,
+
+      // A chave 'env' define as variáveis de ambiente para a aplicação.
+      // Definir NODE_ENV como 'production' é crucial para carregar o .env.production
+      // e para ativar otimizações de performance em bibliotecas como o Express.
+      env: {
         NODE_ENV: "production"
-      }
-    },
-    
-    // --- AMBIENTE DE DESENVOLVIMENTO ---
-    {
-      name: "atlas-bridge-dev",
-      script: "./src/app.js",
-      // 'watch' reinicia automaticamente a aplicação quando um arquivo é modificado.
-      // Ideal para desenvolvimento.
-      watch: ["src"],
-      watch_delay: 1000,
-      ignore_watch: ["node_modules"],
-      // As variáveis de ambiente definidas aqui serão carregadas
-      // apenas quando o PM2 for iniciado com a flag --env development
-      env_development: {
-        NODE_ENV: "development"
       }
     }
   ]
