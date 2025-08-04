@@ -14,8 +14,6 @@ logger.info('--- Starting Atlas Bridge Bot ---');
 logger.info(`--- Environment: ${config.app.nodeEnv} ---`);
 logger.info('--------------------------------------------------');
 
-// INJEÇÃO DE DEPENDÊNCIA DO DB: Criamos uma pool para cada ambiente se necessário.
-// Para a lógica do Webhook Forwarder, a produção precisa de acesso ao DB de desenvolvimento.
 let devDbPool = null;
 if (config.app.nodeEnv === 'production') {
     const devDatabaseUrl = process.env.DEV_DATABASE_URL;
@@ -65,40 +63,26 @@ bot.launch().then(() => logger.info('Telegram Bot started successfully via polli
 
 const app = express();
 app.use(express.json());
-app.get('/', (req, res) => res.status(200).send(`Atlas Bridge Bot App is alive! [ENV: ${config.app.nodeEnv}]`));
+app.set('trust proxy', 1);
 
-// Injetando ambas as pools de banco de dados nas rotas
+app.get('/', (req, res) => res.status(200).send(`Atlas Bridge Bot App is alive! [ENV: ${config.app.nodeEnv}]`));
 app.use('/webhooks', createWebhookRoutes(bot, dbPool, devDbPool, expectationMessageQueue, expirationQueue));
 
+// CORREÇÃO: Especificar o host '0.0.0.0' para garantir que o servidor
+// escute em todas as interfaces de rede, incluindo localhost.
+// Isso resolve o erro ECONNREFUSED.
 const server = app.listen(config.app.port, '0.0.0.0', () => {
-    logger.info(`Express server listening on port ${config.app.port} for environment ${config.app.nodeEnv}.`);
+    logger.info(`Express server listening on http://0.0.0.0:${config.app.port} for environment ${config.app.nodeEnv}.`);
 });
 
 const gracefulShutdown = async (signal) => {
     logger.info(`\nReceived ${signal}. Shutting down gracefully...`);
     server.close(async () => {
         logger.info('HTTP server closed.');
-        try {
-            if (bot && typeof bot.stop === 'function') {
-                bot.stop(signal);
-                logger.info('Telegram bot polling stopped.');
-            }
-        } catch (err) { logger.error('Error stopping Telegram bot:', err.message); }
-        try {
-            if (expectationMessageQueue) await expectationMessageQueue.close();
-            if (expirationQueue) await expirationQueue.close();
-            logger.info('BullMQ queues closed.');
-        } catch(err) { logger.error('Error closing BullMQ queues:', err.message); }
-        try {
-            await dbPool.end();
-            logger.info('Primary Database pool closed.');
-            if (devDbPool) await devDbPool.end();
-            logger.info('Development Database pool closed.');
-        } catch (err) { logger.error('Error closing database pool:', err.message); }
-        if (mainRedisConnection && mainRedisConnection.status === 'ready') {
-            await mainRedisConnection.quit();
-            logger.info('Main Redis connection closed.');
-        }
+        try { if (bot && typeof bot.stop === 'function') { bot.stop(signal); logger.info('Telegram bot polling stopped.'); } } catch (err) { logger.error('Error stopping Telegram bot:', err.message); }
+        try { if (expectationMessageQueue) await expectationMessageQueue.close(); if (expirationQueue) await expirationQueue.close(); logger.info('BullMQ queues closed.'); } catch(err) { logger.error('Error closing BullMQ queues:', err.message); }
+        try { await dbPool.end(); logger.info('Primary Database pool closed.'); if (devDbPool) await devDbPool.end(); } catch (err) { logger.error('Error closing database pool:', err.message); }
+        if (mainRedisConnection && mainRedisConnection.status === 'ready') { await mainRedisConnection.quit(); logger.info('Main Redis connection closed.'); }
         logger.info('Shutdown complete.');
         process.exit(0);
     });
