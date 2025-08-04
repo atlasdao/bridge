@@ -1,16 +1,16 @@
 const { Queue, Worker } = require('bullmq');
 const IORedis = require('ioredis');
 const config = require('../core/config');
-const { escapeMarkdownV2 } = require('../bot/handlers');
+// CORREÇÃO: Linha adicionada para importar a função de escape. Este era o bug.
+const { escapeMarkdownV2 } = require('../utils/escapeMarkdown');
 
 const QUEUE_NAME = 'expirationJobs';
 
-// MODIFICADO: Passar a configuração do DB para a conexão do BullMQ
 const connection = new IORedis({
     host: config.redis.host,
     port: config.redis.port,
     password: config.redis.password,
-    db: config.redis.db, // <-- Adicionado
+    db: config.redis.db,
     maxRetriesPerRequest: null,
     enableReadyCheck: false,
 });
@@ -28,6 +28,7 @@ const initializeExpirationWorker = (dbPool, botInstanceGetter) => {
         const bot = botInstanceGetter();
 
         if (!bot) {
+            console.error(`[Worker ${QUEUE_NAME}] FATAL: Bot instance is not available. Aborting job ${job.id}.`);
             throw new Error('Bot instance not available for expiration worker.');
         }
 
@@ -47,6 +48,7 @@ const initializeExpirationWorker = (dbPool, botInstanceGetter) => {
                     ['EXPIRED', depixApiEntryId]
                 );
 
+                // Agora a função escapeMarkdownV2 estará disponível aqui.
                 const amountStr = escapeMarkdownV2(Number(requestedBrlAmount).toFixed(2));
                 const message = `O QR Code referente à compra de R\\$ ${amountStr} expirou\\. Por favor, gere um novo se desejar continuar\\.`;
 
@@ -56,7 +58,8 @@ const initializeExpirationWorker = (dbPool, botInstanceGetter) => {
                         await bot.telegram.deleteMessage(telegramUserId, qrMessageId);
                         console.log(`[Worker ${QUEUE_NAME}] Deleted expired QR Code message ${qrMessageId} for user ${telegramUserId}.`);
                     } catch (deleteError) {
-                        console.error(`[Worker ${QUEUE_NAME}] Failed to delete expired QR code message ${qrMessageId}. Error: ${deleteError.message}`);
+                        // Não para a execução se a mensagem já foi apagada ou não existe.
+                        console.error(`[Worker ${QUEUE_NAME}] Failed to delete expired QR code message ${qrMessageId}. It might have been deleted already. Error: ${deleteError.message}`);
                     }
                 }
 
@@ -65,7 +68,7 @@ const initializeExpirationWorker = (dbPool, botInstanceGetter) => {
                 console.log(`[Worker ${QUEUE_NAME}] Expiration message sent to user ${telegramUserId} for ${depixApiEntryId}.`);
 
             } else if (rows.length > 0) {
-                console.log(`[Worker ${QUEUE_NAME}] Transaction ${depixApiEntryId} is no longer PENDING (status: ${rows[0].payment_status}). Job will complete without action.`);
+                console.log(`[Worker ${QUEUE_NAME}] Transaction ${depixApiEntryId} is no longer PENDING (status: ${rows[0].payment_status}). Expiration job will complete without action.`);
             } else {
                 console.warn(`[Worker ${QUEUE_NAME}] Transaction with depix_api_entry_id ${depixApiEntryId} not found.`);
             }
