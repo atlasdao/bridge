@@ -1,9 +1,10 @@
 const path = require('path');
+const logger = require('./logger'); // Importar o logger
 
 const nodeEnv = process.env.NODE_ENV || 'development';
 const envPath = path.resolve(__dirname, `../../.env.${nodeEnv}`);
 
-console.log(`Loading environment variables from: ${envPath}`);
+logger.info(`Loading environment variables from: ${envPath}`);
 require('dotenv').config({ path: envPath });
 
 const config = {
@@ -25,6 +26,8 @@ const config = {
         port: parseInt(process.env.PORT, 10) || (nodeEnv === 'production' ? 3000 : 3001),
         nodeEnv: nodeEnv,
     },
+    // URL interna do ambiente de desenvolvimento para o forwarder.
+    developmentServerUrl: 'http://localhost:3001',
     tor: {
         socksProxy: process.env.TOR_SOCKS_PROXY,
     },
@@ -60,12 +63,12 @@ for (const [key, value] of Object.entries(essentialConfigs)) {
 }
 
 if (!config.tor.socksProxy) {
-    console.warn(`Warning from ${envPath}: Missing TOR_SOCKS_PROXY. API calls to DePix will not go through Tor.`);
+    logger.warn(`Warning from ${envPath}: Missing TOR_SOCKS_PROXY. API calls to DePix will not go through Tor.`);
 }
 
-console.log(`Configuration loaded for NODE_ENV: "${config.app.nodeEnv}"`);
-console.log(`Using App Base URL: ${config.app.baseUrl}`);
-console.log(`Using App Port: ${config.app.port}`);
-console.log(`Using Redis DB: ${config.redis.db}`);
+logger.info(`Configuration loaded for NODE_ENV: "${config.app.nodeEnv}"`);
+logger.info(`Using App Base URL: ${config.app.baseUrl}`);
+logger.info(`Using App Port: ${config.app.port}`);
+logger.info(`Using Redis DB: ${config.redis.db}`);
 
 module.exports = config;

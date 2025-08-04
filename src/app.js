@@ -1,19 +1,31 @@
 const config = require('./core/config');
+const logger = require('./core/logger');
 const { Telegraf } = require('telegraf');
-const express =require('express');
+const express = require('express');
 const { Pool } = require('pg');
 const IORedis = require('ioredis');
-
-// As importações dos módulos permanecem as mesmas
 const { registerBotHandlers } = require('./bot/handlers');
 const { createWebhookRoutes } = require('./routes/webhookRoutes');
 const { initializeExpectationWorker, expectationMessageQueue } = require('./queues/expectationMessageQueue');
 const { initializeExpirationWorker, expirationQueue } = require('./queues/expirationQueue');
 
-console.log('Starting Atlas Bridge Bot...');
+logger.info('--------------------------------------------------');
+logger.info('--- Starting Atlas Bridge Bot ---');
+logger.info(`--- Environment: ${config.app.nodeEnv} ---`);
+logger.info('--------------------------------------------------');
 
-// A configuração do .env já é carregada a partir do config.js
-console.log(`Application starting in NODE_ENV: ${config.app.nodeEnv}`);
+// INJEÇÃO DE DEPENDÊNCIA DO DB: Criamos uma pool para cada ambiente se necessário.
+// Para a lógica do Webhook Forwarder, a produção precisa de acesso ao DB de desenvolvimento.
+let devDbPool = null;
+if (config.app.nodeEnv === 'production') {
+    const devDatabaseUrl = process.env.DEV_DATABASE_URL;
+    if (devDatabaseUrl) {
+        devDbPool = new Pool({ connectionString: devDatabaseUrl });
+        logger.info('Production environment has access to the Development Database for webhook forwarding.');
+    } else {
+        logger.warn('DEV_DATABASE_URL not set in .env.production. Webhook forwarding to dev environment will be disabled.');
+    }
+}
 
 const dbPool = new Pool({
     connectionString: config.supabase.databaseUrl,
@@ -21,10 +33,10 @@ const dbPool = new Pool({
 
 dbPool.query('SELECT NOW() AS now', (err, res) => {
     if (err) {
-        console.error('Error connecting to Supabase database:', err.stack);
+        logger.error('Error connecting to Primary Database:', err.stack);
         process.exit(1);
     } else {
-        console.log('Successfully connected to Supabase database. Current time from DB:', res.rows[0].now);
+        logger.info(`Successfully connected to Primary Database (${config.app.nodeEnv}). DB Time: ${res.rows[0].now}`);
     }
 });
 
@@ -36,91 +48,61 @@ const mainRedisConnection = new IORedis({
     maxRetriesPerRequest: null,
     enableReadyCheck: false
 });
+mainRedisConnection.on('connect', () => logger.info(`Main Redis connection successful to DB ${config.redis.db}.`));
+mainRedisConnection.on('error', (err) => logger.error(`Main Redis connection error to DB ${config.redis.db}:`, err.message));
 
-mainRedisConnection.on('connect', () => {
-    console.log(`Main Redis connection successful to DB ${config.redis.db}.`);
-});
-mainRedisConnection.on('error', (err) => {
-    console.error(`Main Redis connection error to DB ${config.redis.db}:`, err.message);
-});
-
-// A instância do bot é criada aqui e será injetada onde for necessária.
 const bot = new Telegraf(config.telegram.botToken);
-
-// O getter agora é mais simples e não precisa de inicialização lazy.
 const getBotInstance = () => bot;
 
-// INJEÇÃO DE DEPENDÊNCIA: O 'bot' é passado para os handlers e workers.
 registerBotHandlers(bot, dbPool, expectationMessageQueue, expirationQueue);
 initializeExpectationWorker(dbPool, getBotInstance);
 initializeExpirationWorker(dbPool, getBotInstance);
 
-bot.launch()
-    .then(() => console.log('Telegram Bot started successfully via polling.'))
-    .catch(err => {
-        console.error('Error starting Telegram Bot:', err);
-        process.exit(1);
-    });
+bot.launch().then(() => logger.info('Telegram Bot started successfully via polling.')).catch(err => {
+    logger.error('Error starting Telegram Bot:', err);
+    process.exit(1);
+});
 
 const app = express();
 app.use(express.json());
+app.get('/', (req, res) => res.status(200).send(`Atlas Bridge Bot App is alive! [ENV: ${config.app.nodeEnv}]`));
 
-app.get('/', (req, res) => {
-    res.status(200).send(`Atlas Bridge Bot App is alive! [ENV: ${config.app.nodeEnv}]`);
-});
-
-// INJEÇÃO DE DEPENDÊNCIA: O 'bot' também é passado para as rotas de webhook.
-// Isso quebra o ciclo de dependência, que era a causa do bug.
-app.use('/webhooks', createWebhookRoutes(bot, dbPool, expectationMessageQueue, expirationQueue));
+// Injetando ambas as pools de banco de dados nas rotas
+app.use('/webhooks', createWebhookRoutes(bot, dbPool, devDbPool, expectationMessageQueue, expirationQueue));
 
 const server = app.listen(config.app.port, '0.0.0.0', () => {
-    console.log(`Express server listening on port ${config.app.port} for environment ${config.app.nodeEnv}.`);
-    console.log(`Webhook endpoint expected at ${config.app.baseUrl}/webhooks/depix_payment`);
+    logger.info(`Express server listening on port ${config.app.port} for environment ${config.app.nodeEnv}.`);
 });
 
 const gracefulShutdown = async (signal) => {
-    console.log(`\nReceived ${signal}. Shutting down gracefully...`);
+    logger.info(`\nReceived ${signal}. Shutting down gracefully...`);
     server.close(async () => {
-        console.log('HTTP server closed.');
-        console.log('Stopping Telegram bot...');
+        logger.info('HTTP server closed.');
         try {
             if (bot && typeof bot.stop === 'function') {
-                 bot.stop(signal);
-                 console.log('Telegram bot polling stopped.');
+                bot.stop(signal);
+                logger.info('Telegram bot polling stopped.');
             }
-        } catch (err) { console.error('Error stopping Telegram bot:', err.message); }
-
-        console.log('Closing BullMQ queue connections...');
+        } catch (err) { logger.error('Error stopping Telegram bot:', err.message); }
         try {
             if (expectationMessageQueue) await expectationMessageQueue.close();
             if (expirationQueue) await expirationQueue.close();
-            console.log('BullMQ queues closed.');
-        } catch(err) { console.error('Error closing BullMQ queues:', err.message); }
-        
-        console.log('Closing database pool...');
+            logger.info('BullMQ queues closed.');
+        } catch(err) { logger.error('Error closing BullMQ queues:', err.message); }
         try {
             await dbPool.end();
-            console.log('Database pool closed.');
-        } catch (err) { console.error('Error closing database pool:', err.message); }
-
-        console.log('Closing main Redis connection...');
-        try {
-            if (mainRedisConnection && mainRedisConnection.status === 'ready') {
-                await mainRedisConnection.quit();
-                console.log('Main Redis connection closed.');
-            }
-        } catch (err) { console.error('Error closing main Redis connection:', err.message); }
-        
-        console.log('Shutdown complete.');
+            logger.info('Primary Database pool closed.');
+            if (devDbPool) await devDbPool.end();
+            logger.info('Development Database pool closed.');
+        } catch (err) { logger.error('Error closing database pool:', err.message); }
+        if (mainRedisConnection && mainRedisConnection.status === 'ready') {
+            await mainRedisConnection.quit();
+            logger.info('Main Redis connection closed.');
+        }
+        logger.info('Shutdown complete.');
         process.exit(0);
     });
-    setTimeout(() => {
-        console.error('Graceful shutdown timed out, forcing exit.');
-        process.exit(1);
-    }, 15000);
 };
 
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-
-console.log('Application setup complete. Bot and server are running.');
