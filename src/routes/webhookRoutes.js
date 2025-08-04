@@ -2,7 +2,8 @@ const express = require('express');
 const crypto = require('crypto');
 const { Markup } = require('telegraf');
 const config = require('../core/config');
-const { escapeMarkdownV2 } = require('../bot/handlers');
+// CORREÇÃO: Importando a função do novo arquivo de utilitários.
+const { escapeMarkdownV2 } = require('../utils/escapeMarkdown');
 
 const safeCompare = (a, b) => {
     if (typeof a !== 'string' || typeof b !== 'string') { return false; }
@@ -14,7 +15,8 @@ const safeCompare = (a, b) => {
     } catch (e) { console.error("Error in safeCompare:", e); return false; }
 };
 
-const createWebhookRoutes = (dbPool, expectationMessageQueue, expirationQueue) => { // Aceitar a nova fila
+// CORREÇÃO: Recebendo a instância do bot via injeção de dependência.
+const createWebhookRoutes = (bot, dbPool, expectationMessageQueue, expirationQueue) => {
     const router = express.Router();
 
     router.post('/depix_payment', async (req, res) => {
@@ -45,7 +47,6 @@ const createWebhookRoutes = (dbPool, expectationMessageQueue, expirationQueue) =
             return res.status(400).send('Bad Request: Missing required fields.');
         }
         
-        // REMOVER JOBS DE AMBAS AS FILAS
         const reminderJobId = `expectation-${qrId}`;
         const expirationJobId = `expiration-${qrId}`;
         try {
@@ -59,14 +60,13 @@ const createWebhookRoutes = (dbPool, expectationMessageQueue, expirationQueue) =
         console.log(`Processing webhook for qrId: ${qrId}, status: ${status}`);
 
         try {
-            // BUSCAR OS IDs DAS MENSAGENS JUNTO COM OS OUTROS DADOS
             const { rows } = await dbPool.query(
                 'SELECT transaction_id, user_id, requested_brl_amount, qr_code_message_id, reminder_message_id FROM pix_transactions WHERE depix_api_entry_id = $1 AND payment_status = $2',
                 [qrId, 'PENDING']
             );
 
             if (rows.length === 0) {
-                console.warn(`No PENDING transaction found for depix_api_entry_id (qrId): ${qrId}. Current webhook status: ${status}.`);
+                console.warn(`No PENDING transaction found for depix_api_entry_id (qrId): ${qrId}. Current webhook status: ${status}. It might have been processed already.`);
                 return res.status(200).send('OK: Transaction not found in PENDING state or already processed.');
             }
 
@@ -83,10 +83,10 @@ const createWebhookRoutes = (dbPool, expectationMessageQueue, expirationQueue) =
                 await dbPool.query( 'UPDATE pix_transactions SET payment_status = $1, depix_txid = $2, webhook_received_at = NOW(), updated_at = NOW() WHERE transaction_id = $3', [newPaymentStatus, blockchainTxID, ourTransactionId]);
                 console.log(`Transaction ${ourTransactionId} updated to ${newPaymentStatus}`);
 
-                const botInstance = require('../app').getBotInstance(); 
+                // Usa a instância do bot injetada, que agora é garantida.
+                const botInstance = bot;
                 
                 if (botInstance && recipientTelegramUserId) {
-                    // TENTAR APAGAR MENSAGENS ANTERIORES
                     if (qrMessageId) {
                         try { await botInstance.telegram.deleteMessage(recipientTelegramUserId, qrMessageId); console.log(`Deleted QR message ${qrMessageId}`); }
                         catch (e) { console.error(`Failed to delete QR message ${qrMessageId}: ${e.message}`); }

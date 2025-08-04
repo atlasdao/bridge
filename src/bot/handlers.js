@@ -1,11 +1,8 @@
 const { Markup } = require('telegraf');
 const config = require('../core/config');
 const depixApiService = require('../services/depixApiService');
-
-const escapeMarkdownV2 = (text) => {
-    if (typeof text !== 'string') return '';
-    return text.replace(/([_*\[\]()~`>#+\-=|{}.!])/g, '\\$1');
-};
+// CORREÇÃO: Importando a função do novo arquivo de utilitários.
+const { escapeMarkdownV2 } = require('../utils/escapeMarkdown');
 
 const isValidLiquidAddress = (address) => {
     if (!address || typeof address !== 'string') return false;
@@ -21,7 +18,7 @@ const isValidLiquidAddress = (address) => {
 
 let awaitingInputForUser = {}; 
 
-const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQueue) => { // Aceitar a nova fila
+const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQueue) => { 
     const logError = (handlerName, error, ctx) => {
         const userId = ctx?.from?.id || 'N/A';
         console.error(`Error in ${handlerName} for user ${userId}:`, error.message);
@@ -191,7 +188,6 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
                     const internalTxId = dbResult.rows[0].transaction_id;
                     console.log(`Transaction ${internalTxId} for BRL ${requestedBrlAmount.toFixed(2)} saved. DePix API ID: ${depixApiEntryId}`);
 
-                    // AGENDAR OS TRABALHOS NAS FILAS
                     const reminderJobId = `expectation-${depixApiEntryId}`;
                     await expectationMessageQueue.add(reminderJobId, { telegramUserId, depixApiEntryId, supportContact: escapeMarkdownV2(config.links.supportContact) }, { delay: 70 * 1000, removeOnComplete: true, removeOnFail: 5, jobId: reminderJobId });
                     
@@ -207,7 +203,6 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
                     await ctx.telegram.deleteMessage(ctx.chat.id, messageIdToUpdate);
                     const qrPhotoMessage = await ctx.replyWithPhoto(qrImageUrl, { caption: caption, parse_mode: 'MarkdownV2' });
 
-                    // SALVAR O ID DA MENSAGEM DO QR CODE
                     await dbPool.query('UPDATE pix_transactions SET qr_code_message_id = $1 WHERE transaction_id = $2', [qrPhotoMessage.message_id, internalTxId]);
 
                     clearUserState(telegramUserId);
@@ -404,4 +399,4 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
     console.log('Bot handlers registered.');
 };
 
-module.exports = { registerBotHandlers, escapeMarkdownV2 };
+module.exports = { registerBotHandlers }; // Não exportamos mais o escapeMarkdownV2 daqui

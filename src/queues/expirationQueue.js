@@ -5,22 +5,24 @@ const { escapeMarkdownV2 } = require('../bot/handlers');
 
 const QUEUE_NAME = 'expirationJobs';
 
+// MODIFICADO: Passar a configuração do DB para a conexão do BullMQ
 const connection = new IORedis({
     host: config.redis.host,
     port: config.redis.port,
     password: config.redis.password,
+    db: config.redis.db, // <-- Adicionado
     maxRetriesPerRequest: null,
     enableReadyCheck: false,
 });
 
-connection.on('connect', () => console.log(`BullMQ Redis connected for ${QUEUE_NAME} queue.`));
-connection.on('error', (err) => console.error(`BullMQ Redis connection error for ${QUEUE_NAME}:`, err));
+connection.on('connect', () => console.log(`BullMQ Redis connected for ${QUEUE_NAME} queue on DB ${config.redis.db}.`));
+connection.on('error', (err) => console.error(`BullMQ Redis connection error for ${QUEUE_NAME} on DB ${config.redis.db}:`, err));
 
 const expirationQueue = new Queue(QUEUE_NAME, { connection });
-console.log(`BullMQ Queue "${QUEUE_NAME}" initialized.`);
+console.log(`BullMQ Queue "${QUEUE_NAME}" initialized on DB ${config.redis.db}.`);
 
 const initializeExpirationWorker = (dbPool, botInstanceGetter) => {
-    console.log(`Initializing BullMQ Worker for queue: ${QUEUE_NAME}`);
+    console.log(`Initializing BullMQ Worker for queue: ${QUEUE_NAME} on DB ${config.redis.db}`);
     const worker = new Worker(QUEUE_NAME, async (job) => {
         const { telegramUserId, depixApiEntryId, requestedBrlAmount } = job.data;
         const bot = botInstanceGetter();

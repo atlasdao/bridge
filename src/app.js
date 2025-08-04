@@ -1,17 +1,19 @@
 const config = require('./core/config');
 const { Telegraf } = require('telegraf');
-const express = require('express');
+const express =require('express');
 const { Pool } = require('pg');
 const IORedis = require('ioredis');
 
+// As importações dos módulos permanecem as mesmas
 const { registerBotHandlers } = require('./bot/handlers');
 const { createWebhookRoutes } = require('./routes/webhookRoutes');
 const { initializeExpectationWorker, expectationMessageQueue } = require('./queues/expectationMessageQueue');
-// IMPORTAR A NOVA FILA
 const { initializeExpirationWorker, expirationQueue } = require('./queues/expirationQueue');
 
 console.log('Starting Atlas Bridge Bot...');
-console.log('NODE_ENV:', config.app.nodeEnv);
+
+// A configuração do .env já é carregada a partir do config.js
+console.log(`Application starting in NODE_ENV: ${config.app.nodeEnv}`);
 
 const dbPool = new Pool({
     connectionString: config.supabase.databaseUrl,
@@ -30,31 +32,26 @@ const mainRedisConnection = new IORedis({
     host: config.redis.host,
     port: config.redis.port,
     password: config.redis.password,
+    db: config.redis.db,
     maxRetriesPerRequest: null,
     enableReadyCheck: false
 });
 
 mainRedisConnection.on('connect', () => {
-    console.log('Main Redis connection successful.');
+    console.log(`Main Redis connection successful to DB ${config.redis.db}.`);
 });
 mainRedisConnection.on('error', (err) => {
-    console.error('Main Redis connection error:', err.message);
+    console.error(`Main Redis connection error to DB ${config.redis.db}:`, err.message);
 });
 
+// A instância do bot é criada aqui e será injetada onde for necessária.
 const bot = new Telegraf(config.telegram.botToken);
 
-let botInstanceInternal = null;
-const getBotInstance = () => {
-    if (!botInstanceInternal) {
-        botInstanceInternal = bot;
-    }
-    return botInstanceInternal;
-};
-module.exports.getBotInstance = getBotInstance;
+// O getter agora é mais simples e não precisa de inicialização lazy.
+const getBotInstance = () => bot;
 
-// PASSAR A NOVA FILA PARA OS HANDLERS
+// INJEÇÃO DE DEPENDÊNCIA: O 'bot' é passado para os handlers e workers.
 registerBotHandlers(bot, dbPool, expectationMessageQueue, expirationQueue);
-// INICIALIZAR O NOVO WORKER
 initializeExpectationWorker(dbPool, getBotInstance);
 initializeExpirationWorker(dbPool, getBotInstance);
 
@@ -69,15 +66,15 @@ const app = express();
 app.use(express.json());
 
 app.get('/', (req, res) => {
-    res.status(200).send('Atlas Bridge Bot App is alive!');
+    res.status(200).send(`Atlas Bridge Bot App is alive! [ENV: ${config.app.nodeEnv}]`);
 });
 
-// PASSAR A NOVA FILA PARA AS ROTAS DE WEBHOOK
-app.use('/webhooks', createWebhookRoutes(dbPool, expectationMessageQueue, expirationQueue));
+// INJEÇÃO DE DEPENDÊNCIA: O 'bot' também é passado para as rotas de webhook.
+// Isso quebra o ciclo de dependência, que era a causa do bug.
+app.use('/webhooks', createWebhookRoutes(bot, dbPool, expectationMessageQueue, expirationQueue));
 
 const server = app.listen(config.app.port, '0.0.0.0', () => {
-    console.log(`Express server listening on port ${config.app.port}.`);
-    console.log(`Caddy should proxy requests from ${config.app.baseUrl} to localhost:${config.app.port}`);
+    console.log(`Express server listening on port ${config.app.port} for environment ${config.app.nodeEnv}.`);
     console.log(`Webhook endpoint expected at ${config.app.baseUrl}/webhooks/depix_payment`);
 });
 
@@ -93,13 +90,13 @@ const gracefulShutdown = async (signal) => {
             }
         } catch (err) { console.error('Error stopping Telegram bot:', err.message); }
 
-        console.log('Closing BullMQ queue and worker connections...');
+        console.log('Closing BullMQ queue connections...');
         try {
             if (expectationMessageQueue) await expectationMessageQueue.close();
-            if (expirationQueue) await expirationQueue.close(); // FECHAR A NOVA FILA
+            if (expirationQueue) await expirationQueue.close();
             console.log('BullMQ queues closed.');
         } catch(err) { console.error('Error closing BullMQ queues:', err.message); }
-
+        
         console.log('Closing database pool...');
         try {
             await dbPool.end();
