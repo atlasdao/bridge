@@ -79,13 +79,13 @@ const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expira
         logger.info(`[Process] Notification SENT to user ${recipientTelegramUserId} for transaction ${ourTransactionId}`);
 
         if (newPaymentStatus === 'PAID') {
-            const feedbackMessage = "O bot está te ajudando? Não estamos conseguindo cobrir os custos de infraestrutura, considere fazer uma doação para manter o bot no ar e financiar o desenvolvimento contínuo. Envie Depix para: \n\n VJLBCUaw6GL8AuyjsrwpwTYNCUfUxPVTfxxffNTEZMKEjSwamWL6YqUUWLvz89ts1scTDKYoTF8oruMX";
-            const feedbackLink = "https://coinos.io/AtlasDAO";
+            const feedbackMessage = "Novidade: Se chegarmos a 150 pessoas em nossa comunidade do Telegram até ao final desse mês, traremos no Bot uma das funções mais pedidas por vocês. Entre e compartilhe";
+            const feedbackLink = "https://t.me/+0PuiQpwJiEc1NTA5";
             
             setTimeout(async () => {
                 try {
                     await bot.telegram.sendMessage(recipientTelegramUserId, feedbackMessage, Markup.inlineKeyboard([
-                        [Markup.button.url('Ou, clique aqui para doar BTC lightning, On-chain ou Liquid', feedbackLink)]
+                        [Markup.button.url('Entrar na Comunidade', feedbackLink)]
                     ]));
                     logger.info(`[Process] Donation request sent to user ${recipientTelegramUserId}.`);
                 } catch (feedbackError) {
