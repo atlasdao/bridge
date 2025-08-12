@@ -28,7 +28,7 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
     };
 
     const mainMenuKeyboardObj = Markup.inlineKeyboard([
-        [Markup.button.callback('💸 Receber Pix em DePix', 'receive_pix_start')],
+        [Markup.button.callback('💸 Comprar Depix Liquid', 'receive_pix_start')],
         [Markup.button.callback('💼 Minha Carteira', 'my_wallet')],
         [Markup.button.callback('ℹ️ Sobre o Bridge', 'about_bridge')],
         [Markup.button.url('💬 Comunidade Atlas', config.links.communityGroup)]
