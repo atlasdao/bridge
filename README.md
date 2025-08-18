@@ -69,7 +69,7 @@ A Atlas DAO opera como uma Organização Autônoma Descentralizada. O financiame
 *   **Endereço para doações DEPIX LIGHTNING :**
     `atlasdao@joltz.app`
 *   **Doe Bitcoin Lightning ou On-chain:**
-    `https://coinos.io/AtlasDAO/`
+    `[https://coinos.io/AtlasDAO/](https://coinos.io/AtlasDAO/)`
 
 ## Licença
 
