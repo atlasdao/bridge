@@ -3,6 +3,7 @@ const config = require('../core/config');
 const logger = require('../core/logger');
 const depixApiService = require('../services/depixApiService');
 const { escapeMarkdownV2 } = require('../utils/escapeMarkdown');
+const securityService = require('../services/securityService');
 
 const isValidLiquidAddress = (address) => {
     if (!address || typeof address !== 'string') return false;
@@ -27,23 +28,74 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
         }
     };
 
+    // Menu principal para usuários validados
     const mainMenuKeyboardObj = Markup.inlineKeyboard([
         [Markup.button.callback('💸 Comprar Depix Liquid', 'receive_pix_start')],
+        [Markup.button.callback('📊 Meu Status', 'user_status')],
         [Markup.button.callback('💼 Minha Carteira', 'my_wallet')],
+        [Markup.button.callback('📈 Histórico', 'transaction_history')],
         [Markup.button.callback('ℹ️ Sobre o Bridge', 'about_bridge')],
         [Markup.button.url('💬 Comunidade Atlas', config.links.communityGroup)]
     ]);
+    
+    // Menu para usuários não validados (só aparece após cadastrar wallet)
+    const unverifiedMenuKeyboardObj = Markup.inlineKeyboard([
+        [Markup.button.callback('✅ Validar Minha Conta', 'start_validation')],
+        [Markup.button.callback('ℹ️ Por que validar?', 'why_validate')],
+        [Markup.button.callback('💼 Minha Carteira', 'my_wallet')],
+        [Markup.button.url('💬 Comunidade Atlas', config.links.communityGroup)]
+    ]);
 
-    const sendMainMenu = async (ctx, messageText = 'O que você gostaria de fazer hoje?') => {
+    const sendMainMenu = async (ctx, messageText = null) => {
         try {
-            if (ctx.callbackQuery?.message?.message_id) {
-                await ctx.editMessageText(messageText, { reply_markup: mainMenuKeyboardObj.reply_markup });
+            const userId = ctx.from?.id;
+            
+            // Verificar se o usuário está validado
+            const userStatus = await securityService.getUserStatus(dbPool, userId);
+            
+            let keyboard, message;
+            
+            if (!userStatus || !userStatus.liquid_address) {
+                // Usuário sem wallet cadastrada - redirecionar para configuração inicial
+                message = messageText || 'Você precisa configurar sua carteira primeiro.';
+                keyboard = initialConfigKeyboardObj;
+            } else if (!userStatus.is_verified) {
+                // Usuário com wallet mas não validado
+                message = messageText || `🔐 **Conta não validada**\n\n` +
+                    `Para usar o Bridge e realizar transações, você precisa validar sua conta primeiro\\.\n\n` +
+                    `A validação é rápida e serve para confirmar que você não é um robô\\.\n\n` +
+                    `Após validar, você terá acesso a todas as funcionalidades com limite inicial de R\\$ 50/dia\\.`;
+                keyboard = unverifiedMenuKeyboardObj;
+            } else if (userStatus.is_banned) {
+                // Usuário banido
+                message = `🚫 **Conta Banida**\n\n` +
+                    `Sua conta foi banida do sistema\\.\n` +
+                    `Motivo: ${escapeMarkdownV2(userStatus.ban_reason || 'Violação dos termos de uso')}\n\n` +
+                    `Entre em contato com o suporte: ${escapeMarkdownV2(config.links.supportContact)}`;
+                keyboard = Markup.inlineKeyboard([
+                    [Markup.button.url('📞 Contatar Suporte', `https://t.me/${config.links.supportContact.replace('@', '')}`)]
+                ]);
             } else {
-                await ctx.reply(messageText, mainMenuKeyboardObj);
+                // Usuário validado - menu completo
+                message = messageText || `✅ Bem-vindo de volta!\n\nO que você gostaria de fazer hoje?`;
+                keyboard = mainMenuKeyboardObj;
+            }
+            
+            if (ctx.callbackQuery?.message?.message_id) {
+                await ctx.editMessageText(message, { 
+                    reply_markup: keyboard.reply_markup,
+                    parse_mode: message.includes('*') ? 'MarkdownV2' : undefined
+                });
+            } else {
+                if (message.includes('*')) {
+                    await ctx.replyWithMarkdownV2(message, { reply_markup: keyboard.reply_markup });
+                } else {
+                    await ctx.reply(message, keyboard);
+                }
             }
         } catch (error) {
             logError('sendMainMenu/editOrReply', error, ctx);
-            if (!ctx.headersSent) await ctx.reply(messageText, mainMenuKeyboardObj); // Fallback
+            if (!ctx.headersSent) await ctx.reply('Ocorreu um erro. Use /start para recomeçar.');
         }
     };
     
@@ -68,7 +120,14 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
             if (rows.length > 0 && rows[0].liquid_address) {
                 await sendMainMenu(ctx, 'Bem-vindo de volta! O que você gostaria de fazer hoje?');
             } else {
-                const initialMessage = `Olá\\! Bem\\-vindo ao **Bridge Bot** da Atlas\\. 🚀\nCom o Bridge Bot, você pode:\n\n\\- 💰 **Receber pagamentos Pix** de clientes diretamente em sua carteira DePix \\(BRL digital soberano\\)\\.\n\nPara receber seus DePix, precisamos saber o endereço da sua carteira Liquid\\. Você já tem uma?`;
+                const initialMessage = `🌟 **Bem\\-vindo ao Bridge Atlas\\!**\n\n` +
+                                      `Somos a ponte entre o sistema financeiro tradicional e a soberania digital\\.\n\n` +
+                                      `💎 **O que você pode fazer:**\n` +
+                                      `• Converter PIX em DePix \\(Real digital soberano\\)\n` +
+                                      `• Manter controle total sobre seus fundos\n` +
+                                      `• Transacionar com privacidade e segurança\n\n` +
+                                      `🔐 Para começar, precisamos do endereço da sua carteira Liquid\\.\n\n` +
+                                      `Você já possui uma carteira?`;
                 await ctx.replyWithMarkdownV2(initialMessage, initialConfigKeyboardObj);
                 if (rows.length === 0) {
                     await dbPool.query('INSERT INTO users (telegram_user_id, telegram_username) VALUES ($1, $2) ON CONFLICT (telegram_user_id) DO NOTHING', [telegramUserId, telegramUsername]);
@@ -138,16 +197,52 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
 
         if (text.startsWith('/')) { clearUserState(telegramUserId); return; }
         logger.info(`Text input from User ${telegramUserId}: "${text}" in state: ${JSON.stringify(userState)}`);
+        
+        // Apagar mensagem do usuário para manter o chat limpo (exceto comandos)
+        if (userState && !text.startsWith('/')) {
+            try {
+                await ctx.deleteMessage();
+            } catch (e) {
+                // Ignorar erro se não conseguir apagar
+            }
+        }
 
         if (userState && userState.type === 'amount') {
+            // Validação de segurança - limitar tentativas muito rápidas
+            const now = Date.now();
+            if (userState.lastAttempt && (now - userState.lastAttempt) < 1000) {
+                await ctx.reply('⚠️ Aguarde um momento antes de tentar novamente.');
+                return;
+            }
+            userState.lastAttempt = now;
+            
             const amount = parseFloat(text.replace(',', '.')); 
-            if (!isNaN(amount) && amount >= 1 && amount <= 5000) {
+            
+            // Verificar limite do usuário antes de validar o valor
+            const userStatusCheck = await securityService.getUserStatus(dbPool, telegramUserId);
+            const maxAllowed = Math.min(
+                userStatusCheck?.available_today || 50,
+                userStatusCheck?.max_per_transaction_brl || 5000
+            );
+            
+            // Validação adicional - impedir valores suspeitos
+            if (!isNaN(amount) && amount >= 1 && amount <= maxAllowed && amount.toFixed(2) == amount) {
                 logger.info(`Received amount ${amount} for deposit from user ${telegramUserId}`);
                 let messageIdToUpdate = userState.messageIdToEdit;
 
                 try {
-                    const sentMsg = messageIdToUpdate ? await ctx.telegram.editMessageText(ctx.chat.id, messageIdToUpdate, undefined, 'Verificando status do serviço DePix...') : await ctx.reply('Verificando status do serviço DePix...');
+                    const sentMsg = messageIdToUpdate ? await ctx.telegram.editMessageText(ctx.chat.id, messageIdToUpdate, undefined, 'Verificando seus limites...') : await ctx.reply('Verificando seus limites...');
                     messageIdToUpdate = sentMsg.message_id;
+                    
+                    // Verificar se o usuário pode fazer a transação com base nos limites
+                    const canTransact = await securityService.checkUserCanTransact(dbPool, telegramUserId, amount);
+                    if (!canTransact.canTransact) {
+                        clearUserState(telegramUserId);
+                        await ctx.telegram.editMessageText(ctx.chat.id, messageIdToUpdate, undefined, `❌ ${canTransact.reason}`);
+                        return;
+                    }
+                    
+                    await ctx.telegram.editMessageText(ctx.chat.id, messageIdToUpdate, undefined, 'Verificando status do serviço DePix...');
                     
                     if (!await depixApiService.ping()) { clearUserState(telegramUserId); await ctx.telegram.editMessageText(ctx.chat.id, messageIdToUpdate, undefined, 'O serviço DePix parece estar instável. Tente novamente mais tarde.'); return; }
                                         
@@ -171,18 +266,35 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
                     logger.info(`Transaction ${internalTxId} for BRL ${amount.toFixed(2)} saved. DePix API ID: ${depixApiEntryId}`);
 
                     const reminderJobId = `expectation-${depixApiEntryId}`;
-                    await expectationMessageQueue.add(reminderJobId, { telegramUserId, depixApiEntryId, supportContact: escapeMarkdownV2(config.links.supportContact) }, { delay: 70 * 1000, removeOnComplete: true, removeOnFail: true, jobId: reminderJobId });
+                    await expectationMessageQueue.add(reminderJobId, { telegramUserId, depixApiEntryId, supportContact: escapeMarkdownV2(config.links.supportContact) }, { delay: 19 * 60 * 1000, removeOnComplete: true, removeOnFail: true, jobId: reminderJobId });
                     
                     const expirationJobId = `expiration-${depixApiEntryId}`;
-                    await expirationQueue.add(expirationJobId, { telegramUserId, depixApiEntryId, requestedBrlAmount: amount }, { delay: 30 * 60 * 1000, removeOnComplete: true, removeOnFail: true, jobId: expirationJobId });
+                    await expirationQueue.add(expirationJobId, { telegramUserId, depixApiEntryId, requestedBrlAmount: amount }, { delay: 19 * 60 * 1000, removeOnComplete: true, removeOnFail: true, jobId: expirationJobId });
                     logger.info(`Jobs added: Reminder (${reminderJobId}) and Expiration (${expirationJobId}) for user ${telegramUserId}`);
 
-                    let caption = `Pronto\\! Use o QR Code ou o código abaixo para pagar:\n\n`;
-                    caption += `Copia e Cola:\n\`${escapeMarkdownV2(qrCopyPaste)}\`\n\n`; 
-                    caption += `Você receberá aprox\\. \`${(amount - 0.99).toFixed(2)}\` DePix assim que o pagamento for confirmado\\.`;
+                    let caption = `✅ **QR Code Gerado com Sucesso\\!**\n\n`;
+                    caption += `💵 **Valor a pagar:** R\\$ ${escapeMarkdownV2(amount.toFixed(2))}\n`;
+                    caption += `💰 **Você receberá:** ${escapeMarkdownV2((amount - 0.99).toFixed(2))} DePix\n`;
+                    caption += `⏱️ **Válido por:** 19 minutos\n\n`;
+                    caption += `📋 **PIX Copia e Cola:**\n`;
+                    caption += `\`${escapeMarkdownV2(qrCopyPaste)}\`\n\n`;
+                    caption += `⚠️ **ATENÇÃO IMPORTANTE:**\n`;
+                    caption += `• Você deve fazer o pagamento com a mesma conta \\(CPF/CNPJ\\) que foi validada\\.\n`;
+                    caption += `• Pagamentos de contas diferentes serão recusados automaticamente\\.\n`;
+                    caption += `• Após o pagamento, você receberá os DePix em sua carteira Liquid\\.`;
                     
                     await ctx.telegram.deleteMessage(ctx.chat.id, messageIdToUpdate);
-                    const qrPhotoMessage = await ctx.replyWithPhoto(qrImageUrl, { caption: caption, parse_mode: 'MarkdownV2' });
+                    
+                    // Adicionar botão de cancelar
+                    const keyboard = Markup.inlineKeyboard([
+                        [Markup.button.callback('❌ Cancelar', `cancel_qr:${depixApiEntryId}`)]
+                    ]);
+                    
+                    const qrPhotoMessage = await ctx.replyWithPhoto(qrImageUrl, { 
+                        caption: caption, 
+                        parse_mode: 'MarkdownV2',
+                        reply_markup: keyboard.reply_markup
+                    });
 
                     await dbPool.query('UPDATE pix_transactions SET qr_code_message_id = $1 WHERE transaction_id = $2', [qrPhotoMessage.message_id, internalTxId]);
                     clearUserState(telegramUserId);
@@ -195,7 +307,7 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
                     else await ctx.reply(errorReply);
                 }
             } else { 
-                await ctx.replyWithMarkdownV2(`Valor inválido\\. Por favor, envie um valor entre R\\$ 1\\.00 e R\\$ 5000\\.00 \\(ex: \`50.21\`\\)\\.`);
+                await ctx.replyWithMarkdownV2(`Valor inválido\\. Por favor, envie um valor entre R\\$ 1\\.00 e R\\$ ${escapeMarkdownV2(maxAllowed.toFixed(2))} \\(ex: \`45.21\`\\)\\.`);
             }
         } else if (userState && (userState.type === 'liquid_address_initial' || userState.type === 'liquid_address_change')) {
             if (isValidLiquidAddress(text)) {
@@ -223,15 +335,68 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
         try {
             clearUserState(ctx.from.id);
             await ctx.answerCbQuery();
-            const { rows } = await dbPool.query('SELECT liquid_address FROM users WHERE telegram_user_id = $1', [ctx.from.id]);
-            if (!rows.length || !rows[0].liquid_address) {
+            
+            const userId = ctx.from.id;
+            
+            // Verificar status completo do usuário
+            const userStatus = await securityService.getUserStatus(dbPool, userId);
+            
+            // Verificar se já tem uma transação pendente
+            const pendingCheck = await dbPool.query(
+                'SELECT COUNT(*) as count FROM pix_transactions WHERE user_id = $1 AND payment_status = $2',
+                [userId, 'PENDING']
+            );
+            
+            if (pendingCheck.rows[0].count > 0) {
+                const message = `⚠️ **Você já tem um QR Code ativo**\n\n` +
+                              `Complete ou cancele o pagamento anterior antes de gerar um novo\\.`;
+                const keyboard = Markup.inlineKeyboard([[Markup.button.callback('⬅️ Voltar', 'back_to_main_menu')]]);
+                await ctx.editMessageText(message, { parse_mode: 'MarkdownV2', reply_markup: keyboard.reply_markup });
+                return;
+            }
+            
+            // Verificar se tem wallet
+            if (!userStatus || !userStatus.liquid_address) {
                 const message = "Você precisa associar uma carteira Liquid primeiro\\! Use o botão abaixo ou o comando /start para reconfigurar\\.";
                 const keyboard = Markup.inlineKeyboard([[Markup.button.callback('✅ Associar Minha Carteira Liquid', 'ask_liquid_address')]]);
                 if (ctx.callbackQuery?.message) await ctx.editMessageText(message, { parse_mode: 'MarkdownV2', reply_markup: keyboard.reply_markup });
                 else await ctx.replyWithMarkdownV2(message, keyboard);
                 return;
             }
-            const amountRequestMessage = `Qual o valor em reais que você deseja receber via Pix? \\(Ex: \`50.21\`\\)\n\nLembre\\-se:\n\\- O valor deve ser entre R\\$ 1\\.00 e R\\$ 5000\\.00\\.\n\\- Há uma taxa de R\\$0,99 pela transação\\.`;
+            
+            // Verificar se está banido
+            if (userStatus.is_banned) {
+                const message = `🚫 **Conta Banida**\n\n` +
+                              `Sua conta está banida e não pode realizar transações\\.\n` +
+                              `Motivo: ${escapeMarkdownV2(userStatus.ban_reason || 'Violação dos termos')}\n\n` +
+                              `Entre em contato com o suporte: ${escapeMarkdownV2(config.links.supportContact)}`;
+                const keyboard = Markup.inlineKeyboard([[Markup.button.callback('⬅️ Voltar', 'back_to_main_menu')]]);
+                await ctx.editMessageText(message, { parse_mode: 'MarkdownV2', reply_markup: keyboard.reply_markup });
+                return;
+            }
+            
+            // Verificar se está validado
+            if (!userStatus.is_verified) {
+                const message = `🔐 **Conta não validada**\n\n` +
+                              `Você precisa validar sua conta antes de realizar transações\\.\n\n` +
+                              `A validação é rápida e custa apenas R\\$ 1,00\\.\n` +
+                              `Você receberá 0,01 DEPIX de recompensa\\!`;
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('✅ Validar Agora', 'start_validation')],
+                    [Markup.button.callback('❓ Por que validar?', 'why_validate')],
+                    [Markup.button.callback('⬅️ Voltar', 'back_to_main_menu')]
+                ]);
+                await ctx.editMessageText(message, { parse_mode: 'MarkdownV2', reply_markup: keyboard.reply_markup });
+                return;
+            }
+            // Obter o limite disponível do usuário
+            const dailyLimit = userStatus.daily_limit_brl || 50;
+            const usedToday = userStatus.actual_daily_used || 0;
+            const availableLimit = Math.max(0, dailyLimit - usedToday);
+            const maxTransaction = userStatus.max_per_transaction_brl || availableLimit;
+            const effectiveMax = Math.min(availableLimit, maxTransaction);
+            
+            const amountRequestMessage = `Qual o valor em reais que você deseja receber via Pix? \\(Ex: \`45.21\`\\)\n\nLembre\\-se:\n\\- O valor deve ser entre R\\$ 1\\.00 e R\\$ ${escapeMarkdownV2(effectiveMax.toFixed(2))}\\.\n\\- Há uma taxa de R\\$0,99 pela transação\\.\n\\- Seu limite disponível hoje: R\\$ ${escapeMarkdownV2(availableLimit.toFixed(2))}`;
             const sentMessage = ctx.callbackQuery?.message ? await ctx.editMessageText(amountRequestMessage, { parse_mode: 'MarkdownV2' }) : await ctx.replyWithMarkdownV2(amountRequestMessage);
             awaitingInputForUser[ctx.from.id] = { type: 'amount', messageIdToEdit: sentMessage?.message_id || null };
         } catch (error) { 
@@ -345,6 +510,309 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
         } catch (error) { 
             logError('about_bridge', error, ctx); 
             await ctx.replyWithMarkdownV2('Ocorreu um erro ao mostrar as informações\\. Tente o menu /start\\.');
+        }
+    });
+
+    bot.action('start_validation', async (ctx) => {
+        try {
+            clearUserState(ctx.from.id);
+            await ctx.answerCbQuery();
+            
+            const userId = ctx.from.id;
+            
+            // Verificar status atual do usuário
+            const userStatus = await securityService.getUserStatus(dbPool, userId);
+            
+            if (userStatus && userStatus.is_verified) {
+                const message = `✅ **Sua conta já está validada\\!**\n\n` +
+                               `⭐ Nível de Reputação: ${userStatus.reputation_level}\n` +
+                               `💰 Limite Diário: R\\$ ${userStatus.daily_limit_brl}\n\n` +
+                               `_Sua conta foi validada e você pode realizar transações\\._`;
+                
+                const keyboard = Markup.inlineKeyboard([[Markup.button.callback('⬅️ Voltar ao Menu', 'back_to_main_menu')]]);
+                await ctx.editMessageText(message, { parse_mode: 'MarkdownV2', reply_markup: keyboard.reply_markup });
+                return;
+            }
+            
+            // Verificar se há uma validação pendente
+            const pendingCheck = await dbPool.query(
+                'SELECT * FROM verification_transactions WHERE telegram_user_id = $1 AND verification_status = $2 ORDER BY created_at DESC LIMIT 1',
+                [userId, 'PENDING']
+            );
+            
+            if (pendingCheck.rows.length > 0) {
+                const message = `⏳ **Você já tem uma validação em andamento\\!**\n\n` +
+                               `Por favor, complete o pagamento de R\\$ 1,00 primeiro\\.\n\n` +
+                               `_Se o pagamento expirou, aguarde alguns minutos e tente novamente\\._`;
+                
+                const keyboard = Markup.inlineKeyboard([[Markup.button.callback('⬅️ Voltar ao Menu', 'back_to_main_menu')]]);
+                await ctx.editMessageText(message, { parse_mode: 'MarkdownV2', reply_markup: keyboard.reply_markup });
+                return;
+            }
+            
+            const validationMessage = `🔐 **Validação de Conta**\n\n` +
+                                     `Para começar a usar o Bridge, precisamos validar sua conta\\. Este processo serve para:\n\n` +
+                                     `✅ Confirmar que você não é um robô\n` +
+                                     `✅ Proteger contra abusos e fraudes\n` +
+                                     `✅ Liberar limites progressivos de transação\n\n` +
+                                     `Ao fazer o pagamento de R\\$ 1,00 você valida sua conta, receberá R\\$ 0,01 e desbloqueará o limite diário de 50 reais\\. Esse limite irá aumentando conforme você vai comprando\\.\n\n` +
+                                     `Deseja continuar com a validação?`;
+            
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('✅ Sim, validar minha conta', 'confirm_validation')],
+                [Markup.button.callback('❌ Cancelar', 'back_to_main_menu')]
+            ]);
+            
+            if (ctx.callbackQuery?.message) {
+                await ctx.editMessageText(validationMessage, { parse_mode: 'MarkdownV2', reply_markup: keyboard.reply_markup });
+            } else {
+                await ctx.replyWithMarkdownV2(validationMessage, { reply_markup: keyboard.reply_markup });
+            }
+            
+        } catch (error) {
+            logError('start_validation', error, ctx);
+            await ctx.reply('Ocorreu um erro ao processar sua solicitação. Tente novamente.');
+        }
+    });
+    
+    bot.action('why_validate', async (ctx) => {
+        try {
+            await ctx.answerCbQuery();
+            
+            const message = `❓ **Por que validar minha conta?**\n\n` +
+                          `A validação é essencial para:\n\n` +
+                          `🤖 **Anti\\-robô:** Confirma que você é uma pessoa real\n\n` +
+                          `🛡️ **Segurança:** Protege contra fraudes e abusos\n\n` +
+                          `📈 **Limites Progressivos:** Começa com R\\$ 50/dia e pode chegar até R\\$ 6\\.020/dia\n\n` +
+                          `🔐 **Proteção de Identidade:** Apenas você poderá fazer transações com seu CPF/CNPJ\n\n` +
+                          `💰 **Custo Único:** Apenas R\\$ 1,00 \\(você recebe 0,01 DEPIX de volta\\)\n\n` +
+                          `⚡ **Processo Rápido:** Leva menos de 2 minutos\n\n` +
+                          `Sem a validação, você não pode realizar transações no Bridge\\.`;
+            
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('✅ Validar Agora', 'start_validation')],
+                [Markup.button.callback('⬅️ Voltar', 'back_to_main_menu')]
+            ]);
+            
+            await ctx.editMessageText(message, { parse_mode: 'MarkdownV2', reply_markup: keyboard.reply_markup });
+            
+        } catch (error) {
+            logError('why_validate', error, ctx);
+            await ctx.reply('Ocorreu um erro. Tente novamente.');
+        }
+    });
+
+    bot.action('confirm_validation', async (ctx) => {
+        try {
+            await ctx.answerCbQuery();
+            const userId = ctx.from.id;
+            const username = ctx.from.username || 'N/A';
+            
+            // Verificar se usuário tem endereço Liquid cadastrado
+            const userCheck = await dbPool.query(
+                'SELECT liquid_address FROM users WHERE telegram_user_id = $1',
+                [userId]
+            );
+            
+            if (userCheck.rows.length === 0 || !userCheck.rows[0].liquid_address) {
+                const message = `❌ **Você precisa cadastrar uma carteira Liquid primeiro\\!**\n\n` +
+                               `Use o menu "💼 Minha Carteira" para adicionar seu endereço Liquid antes de validar a conta\\.`;
+                
+                const keyboard = Markup.inlineKeyboard([[Markup.button.callback('⬅️ Voltar ao Menu', 'back_to_main_menu')]]);
+                await ctx.editMessageText(message, { parse_mode: 'MarkdownV2', reply_markup: keyboard.reply_markup });
+                return;
+            }
+            
+            const liquidAddress = userCheck.rows[0].liquid_address;
+            
+            // Gerar QR Code de R$ 1,00 para validação
+            await ctx.editMessageText('⏳ Gerando QR Code de validação\\.\\.\\.', { parse_mode: 'MarkdownV2' });
+            
+            const pingResult = await depixApiService.ping();
+            if (!pingResult) {
+                await ctx.editMessageText('❌ Erro ao conectar com a API DePix. Tente novamente mais tarde.');
+                return;
+            }
+            
+            // Criar depósito de R$ 1,00
+            const webhookUrl = `${config.app.baseUrl}/webhooks/depix_payment`;
+            let pixData;
+            try {
+                pixData = await depixApiService.generatePixForDeposit(100, liquidAddress, webhookUrl); // 100 centavos = R$ 1,00
+            } catch (error) {
+                await ctx.editMessageText('❌ Erro ao gerar QR Code. Tente novamente.');
+                return;
+            }
+            
+            // Salvar transação de verificação
+            const verificationResult = await securityService.createVerificationTransaction(
+                dbPool,
+                userId,
+                pixData.qrCopyPaste,
+                pixData.id
+            );
+            
+            if (!verificationResult.success) {
+                await ctx.editMessageText('❌ Erro ao criar transação de verificação. Tente novamente.');
+                return;
+            }
+            
+            // Enviar QR Code
+            const qrMessage = await ctx.replyWithPhoto(
+                pixData.qrImageUrl,
+                {
+                    caption: `🔐 **QR Code de Validação**\n\n` +
+                            `💵 Valor: R\\$ 1,00\n` +
+                            `🎁 Recompensa: 0,01 DEPIX\n` +
+                            `⏱️ Válido por: 10 minutos\n\n` +
+                            `**PIX Copia e Cola:**\n` +
+                            `\`${escapeMarkdownV2(pixData.qrCopyPaste)}\`\n\n` +
+                            `⚠️ **IMPORTANTE:** Este pagamento valida sua conta\\. ` +
+                            `Após o pagamento, todos os QR Codes futuros só aceitarão pagamentos do mesmo CPF/CNPJ\\.`,
+                    parse_mode: 'MarkdownV2'
+                }
+            );
+            
+            // Atualizar mensagem ID na transação
+            await dbPool.query(
+                'UPDATE verification_transactions SET qr_code_message_id = $1 WHERE verification_id = $2',
+                [qrMessage.message_id, verificationResult.verificationId]
+            );
+            
+            // Adicionar job de expiração (10 minutos)
+            await expirationQueue.add(
+                `verification-expiration-${pixData.id}`,
+                { 
+                    qrId: pixData.id,
+                    userId: userId,
+                    isVerification: true
+                },
+                { delay: 10 * 60 * 1000 }
+            );
+            
+        } catch (error) {
+            logError('confirm_validation', error, ctx);
+            await ctx.reply('Ocorreu um erro ao gerar o QR Code de validação. Tente novamente.');
+        }
+    });
+
+    // Handler removido - não é mais necessário verificar status manualmente
+    
+    // Handler para cancelar QR code
+    bot.action(/^cancel_qr:(.+)$/, async (ctx) => {
+        try {
+            await ctx.answerCbQuery();
+            const qrId = ctx.match[1];
+            const userId = ctx.from.id;
+            
+            // Verificar se este QR pertence ao usuário
+            const txCheck = await dbPool.query(
+                'SELECT * FROM pix_transactions WHERE depix_api_entry_id = $1 AND user_id = $2 AND payment_status = $3',
+                [qrId, userId, 'PENDING']
+            );
+            
+            if (txCheck.rows.length === 0) {
+                await ctx.answerCbQuery('❌ Transação não encontrada ou já processada', true);
+                return;
+            }
+            
+            // Marcar como cancelado
+            await dbPool.query(
+                'UPDATE pix_transactions SET payment_status = $1 WHERE depix_api_entry_id = $2',
+                ['CANCELLED', qrId]
+            );
+            
+            // Apagar mensagem do QR
+            try {
+                await ctx.deleteMessage();
+            } catch (e) {
+                // Se não conseguir apagar, editar
+                await ctx.editMessageCaption(
+                    `❌ **QR Code Cancelado**\\n\\n` +
+                    `Esta transação foi cancelada pelo usuário\\.`,
+                    { parse_mode: 'MarkdownV2' }
+                );
+            }
+            
+            await ctx.reply('QR Code cancelado. Use o menu para gerar um novo quando desejar.', mainMenuKeyboardObj);
+            
+        } catch (error) {
+            logError('cancel_qr', error, ctx);
+            await ctx.answerCbQuery('❌ Erro ao cancelar', true);
+        }
+    });
+
+    bot.action('user_status', async (ctx) => {
+        try {
+            clearUserState(ctx.from.id);
+            await ctx.answerCbQuery();
+            
+            const userId = ctx.from.id;
+            const userStatus = await securityService.getUserStatus(dbPool, userId);
+            
+            if (!userStatus) {
+                const message = `❌ **Conta não encontrada**\n\n` +
+                               `Use /start para começar\\.`;
+                const keyboard = Markup.inlineKeyboard([[Markup.button.callback('⬅️ Voltar ao Menu', 'back_to_main_menu')]]);
+                await ctx.editMessageText(message, { parse_mode: 'MarkdownV2', reply_markup: keyboard.reply_markup });
+                return;
+            }
+            
+            let statusEmoji = userStatus.is_banned ? '🚫' : (userStatus.is_verified ? '✅' : '⏳');
+            let statusText = userStatus.is_banned ? 'BANIDA' : (userStatus.is_verified ? 'VALIDADA' : 'NÃO VALIDADA');
+            
+            // Calcular progresso para próximo nível
+            let progressBar = '';
+            let nextLevelInfo = '';
+            
+            if (userStatus.is_verified && !userStatus.is_banned && userStatus.reputation_level < 10) {
+                const percentUsed = (userStatus.actual_daily_used / userStatus.daily_limit_brl) * 100;
+                const blocks = Math.floor(percentUsed / 10);
+                progressBar = '▓'.repeat(blocks) + '░'.repeat(10 - blocks);
+                
+                // Verificar se pode subir de nível
+                const upgradeCheck = await securityService.checkAndUpgradeReputation(dbPool, userId);
+                if (upgradeCheck.upgraded) {
+                    nextLevelInfo = `\n🎉 **Parabéns\\! Você subiu para o nível ${upgradeCheck.newLevel}\\!**\n` +
+                                  `Novo limite diário: R\\$ ${upgradeCheck.newLimit}`;
+                } else if (upgradeCheck.message) {
+                    nextLevelInfo = `\n📈 Próximo nível: ${escapeMarkdownV2(upgradeCheck.message)}`;
+                }
+            }
+            
+            const message = `📊 **Status da Conta**\n\n` +
+                          `${statusEmoji} Status: **${statusText}**\n` +
+                          `👤 Usuário: @${escapeMarkdownV2(userStatus.telegram_username || 'N/A')}\n` +
+                          `✅ Conta Verificada: ${userStatus.is_verified ? 'Sim' : 'Não'}\n` +
+                          `\n⭐ **Nível de Reputação:** ${userStatus.reputation_level}/10\n` +
+                          (userStatus.level_description ? `_${escapeMarkdownV2(userStatus.level_description)}_\n` : '') +
+                          `\n💰 **Limites:**\n` +
+                          `  • Diário: R\\$ ${escapeMarkdownV2(String(userStatus.daily_limit_brl || '0.00'))}\n` +
+                          `  • Usado hoje: R\\$ ${escapeMarkdownV2(String(userStatus.actual_daily_used || '0.00'))}\n` +
+                          `  • Disponível: R\\$ ${escapeMarkdownV2(String(userStatus.available_today || '0.00'))}\n` +
+                          (userStatus.max_per_transaction_brl ? 
+                           `  • Máx\\. por transação: R\\$ ${escapeMarkdownV2(String(userStatus.max_per_transaction_brl))}\n` : '') +
+                          (progressBar ? `\n📊 Progresso diário: \[${progressBar}\] ${Math.floor((userStatus.actual_daily_used / userStatus.daily_limit_brl) * 100)}%` : '') +
+                          nextLevelInfo +
+                          (userStatus.is_banned ? 
+                           `\n\n🚫 **CONTA BANIDA**\n` +
+                           `Motivo: ${escapeMarkdownV2(userStatus.ban_reason || 'Violação dos termos')}\n` +
+                           `Entre em contato com o suporte: ${escapeMarkdownV2(config.links.supportContact)}` : '') +
+                          (!userStatus.is_verified ? 
+                           `\n\n⚠️ **Conta não validada**\n` +
+                           `Use o botão "✅ Validar Conta" para começar\\.` : '');
+            
+            const keyboard = Markup.inlineKeyboard([[Markup.button.callback('⬅️ Voltar ao Menu', 'back_to_main_menu')]]);
+            
+            if (ctx.callbackQuery?.message) {
+                await ctx.editMessageText(message, { parse_mode: 'MarkdownV2', reply_markup: keyboard.reply_markup });
+            } else {
+                await ctx.replyWithMarkdownV2(message, { reply_markup: keyboard.reply_markup });
+            }
+            
+        } catch (error) {
+            logError('user_status', error, ctx);
+            await ctx.reply('Ocorreu um erro ao buscar seu status. Tente novamente.');
         }
     });
 

@@ -98,7 +98,25 @@ const generatePixForDeposit = async (amountInCents, userLiquidAddress, webhookUr
     }
 };
 
+const getDepositStatus = async (qrId) => {
+    if (!qrId) {
+        throw new Error('QR ID is required to check deposit status.');
+    }
+    try {
+        const data = await depixApi.get(`/deposit-status/${qrId}`);
+        if (data.response) {
+            return data.response;
+        }
+        throw new Error('Resposta inesperada da API DePix ao verificar status.');
+    } catch (error) {
+        const errorMessage = error.response?.data?.response?.errorMessage || error.message || 'Erro ao verificar status.';
+        logger.error(`Failed to get deposit status: ${errorMessage}`);
+        throw new Error(`Falha ao verificar status: ${errorMessage}`);
+    }
+};
+
 module.exports = {
     ping,
     generatePixForDeposit,
+    getDepositStatus,
 };

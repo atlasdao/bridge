@@ -1,48 +1,267 @@
-# Logs
-logs
+# ==================================================================
+# .gitignore completo para projeto Node.js/Express/Telegram Bot
+# ==================================================================
+
+# Logs e arquivos de debug
+# --------------------------
+logs/
 *.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 lerna-debug.log*
+.npm
+.yarn-integrity
+.yarn
 report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 pids
 *.pid
 *.seed
 *.pid.lock
+pm2-*.log
+bot.log
+error.log
+access.log
+combined.log
 
-# Cache de dependencias
+# Arquivos temporários
+# --------------------
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.cache/
+tmp/
+temp/
+
+# Módulos de dependências
+# -----------------------
 node_modules/
 jspm_packages/
 web_modules/
 bower_components/
+.pnp
+.pnp.js
 
-# Arquivos de ambiente
+# Arquivos de ambiente e configuração sensível
+# ----------------------------------------------
 .env
 .env.*
 !.env.example
+!.env.template
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.backup*
+.env.prod_backup*
+config.json
+config.local.json
+secrets/
+private/
+keys/
+*.key
+*.pem
+*.cert
+*.crt
+*.p12
+*.pfx
 
-# Arquivos de build e distribuição
+# Build e distribuição
+# --------------------
 dist/
 build/
-public/ # Se você tiver assets de frontend gerados aqui
+out/
+public/build/
 coverage/
 .nyc_output/
+lib-cov
+*.tgz
+*.tar.gz
+*.zip
 
-# Arquivos de IDEs e SO
+# IDEs e editores
+# ---------------
 .vscode/
 .idea/
+*.sublime-project
+*.sublime-workspace
+.project
+.settings/
+.classpath
+.factorypath
+.buildpath
+.target
+.launch
+.pydevproject
+.cproject
+.metadata
+.recommenders
+.cache-main
+.scala_dependencies
+*.swp
+*.swo
+*~
 *.suo
+*.user
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
+
+# Sistema operacional
+# -------------------
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+*.lnk
 
-# Telegraf session (se usar telegraf-session-local com arquivo)
-session_db.json 
+# Git
+# ---
+*.orig
+*.rej
+
+# Runtime
+# -------
+.lock-wscript
+lib-cov
+coverage
+nyc_output
+.grunt
+.lock-wscript
+.node_repl_history
+*.tsbuildinfo
+.npm
+
+# Telegram Bot específicos
+# -------------------------
+session_db.json
 *.session.json
+bot-sessions/
+sessions/
 
-# Outros
+# PM2
+# ---
+pm2.json
+ecosystem.config.js.backup
+.pm2/
+
+# Banco de dados
+# --------------
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-shm
+*.db-wal
+data/
+database/
+db/
+backup/
+*.sql.backup
+*.dump
+
+# Backups e arquivos desnecessários
+# ----------------------------------
+*.backup
 *.bak
+*.old
+*backup*
+backup*
+*.orig
+*.rej
+
+# Claude Code
+# -----------
+CLAUDE.md
+.claude/
+claude-*
+*claude*
+
+# Arquivos de sistema e cache
+# ----------------------------
+.cache/
+.parcel-cache/
+.vite/
+.nuxt/
+.next/
+.svelte-kit/
+
+# Testing
+# -------
+.jest/
+jest.config.js.backup
+test-results/
+playwright-report/
+coverage/
+
+# Documentation gerada
+# ---------------------
+docs/generated/
+api-docs/
+typedoc/
+
+# Arquivos específicos do projeto
+# --------------------------------
+2025-*.txt
+*-voce-estava-me-ajudando*.txt
+init_database.sql
+*.js.backup
+*.backup.*
+src/**/*.backup
+
+# Monitoramento e métricas
+# ------------------------
+.nyc_output/
+metrics/
+monitoring/
+
+# Docker (caso adicione no futuro)
+# ---------------------------------
+.dockerignore
+Dockerfile.backup
+docker-compose.override.yml
+
+# Kubernetes (caso adicione no futuro)
+# -------------------------------------
+*.yaml.backup
+k8s/secrets/
+
+# SSL/TLS Certificates
+# --------------------
+*.pem
+*.key
+*.crt
+*.cert
+ssl/
+certs/
+
+# Outros arquivos comuns
+# ----------------------
+.eslintcache
+.stylelintcache
+.sass-cache/
+connect.lock
+typings/
+.history/
+HELP.md
+.hg/
+.bzr/
+.bzrignore
+.hgignore
+.svn/
+
+# Arquivos pessoais/temporários
+# ------------------------------
+TODO.md
+NOTES.md
+scratch/
+playground/
+experiments/
