@@ -9,13 +9,19 @@ const securityService = require('../services/securityService');
 
 const safeCompare = (a, b) => {
     if (typeof a !== 'string' || typeof b !== 'string') return false;
+    if (a.length !== b.length) return false;
     try {
         return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
     } catch (e) { logger.error("Error in safeCompare:", e); return false; }
 };
 
 const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expirationQueue) => {
-    const { blockchainTxID, qrId, status, payerName, payerCpfCnpj } = webhookData;
+    // Log completo dos dados recebidos
+    logger.info(`[Process] Full webhook data received:`, JSON.stringify(webhookData));
+    
+    // DePix envia o CPF/CNPJ como payerTaxNumber
+    const { blockchainTxID, qrId, status, payerName, payerTaxNumber } = webhookData;
+    const payerCpfCnpj = payerTaxNumber; // Mapear para o nome esperado
     
     // Log dos dados do pagador se disponíveis
     if (payerName || payerCpfCnpj) {
@@ -46,6 +52,10 @@ const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expira
             return { success: true, message: 'Verification already processed.' };
         }
         
+        // Log para debug - verificar campos recebidos
+        logger.info(`[Process] Verification webhook - Status: ${status}, Has payerName: ${!!payerName}, Has payerCpfCnpj: ${!!payerCpfCnpj}`);
+        
+        // Verificar se pagamento foi confirmado e tem os dados necessários
         if (status === 'depix_sent' && payerName && payerCpfCnpj) {
             // Processar verificação bem-sucedida
             const result = await securityService.processVerificationPayment(
@@ -61,14 +71,30 @@ const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expira
                 // Enviar mensagem de sucesso ao usuário
                 try {
                     const successMessage = `✅ **Conta Validada com Sucesso\\!**\n\n` +
-                                         `👤 Nome: ${escapeMarkdownV2(payerName)}\n` +
-                                         `📝 CPF/CNPJ: ${escapeMarkdownV2(payerCpfCnpj)}\n` +
                                          `⭐ Nível: 1\n` +
                                          `💰 Limite Diário: R\\$ 50,00\n\n` +
                                          `🎁 Você receberá 0,01 DEPIX de recompensa em breve\\!\n\n` +
                                          `Agora você pode usar todas as funcionalidades do Bridge\\!`;
                     
                     await bot.telegram.sendMessage(result.userId, successMessage, { parse_mode: 'MarkdownV2' });
+                    
+                    // Enviar menu principal imediatamente
+                    const mainMenuKeyboard = Markup.inlineKeyboard([
+                        [Markup.button.callback('💸 Converter PIX em DePix', 'receive_pix_start')],
+                        [Markup.button.callback('📊 Meu Status', 'user_status')],
+                        [Markup.button.callback('💼 Minha Carteira', 'my_wallet')],
+                        [Markup.button.callback('📈 Histórico', 'transaction_history')],
+                        [Markup.button.callback('ℹ️ Sobre o Bridge', 'about_bridge')],
+                        [Markup.button.url('💬 Comunidade Atlas', 'https://t.me/+zVuRYh5nsdE2MTYx')]
+                    ]);
+                    
+                    const menuMessage = `🎯 **Menu Principal**\n\n` +
+                                      `O que deseja fazer?`;
+                    
+                    await bot.telegram.sendMessage(result.userId, menuMessage, {
+                        parse_mode: 'MarkdownV2',
+                        reply_markup: mainMenuKeyboard.reply_markup
+                    });
                 } catch (e) {
                     logger.error(`[Process] Failed to send verification success message: ${e.message}`);
                 }
@@ -260,14 +286,11 @@ const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expira
                 }
             }, 1500);
             
-            const feedbackMessage = "Novidade: Se chegarmos a 150 pessoas em nossa comunidade do Telegram até ao final desse mês, traremos no Bot uma das funções mais pedidas por vocês. Entre e compartilhe";
-            const feedbackLink = "https://t.me/+0PuiQpwJiEc1NTA5";
+            const feedbackMessage = "Ajude a Atlas a crescer e manter um serviço competitivo! Avalie nosso serviço em https://trustscore.space/reviews.html - sua opinião é muito importante para nós.";
             
             setTimeout(async () => {
                 try {
-                    await bot.telegram.sendMessage(recipientTelegramUserId, feedbackMessage, Markup.inlineKeyboard([
-                        [Markup.button.url('Entrar na Comunidade', feedbackLink)]
-                    ]));
+                    await bot.telegram.sendMessage(recipientTelegramUserId, feedbackMessage);
                     logger.info(`[Process] Donation request sent to user ${recipientTelegramUserId}.`);
                 } catch (feedbackError) {
                     logger.error(`[Process] FAILED to send donation request to user ${recipientTelegramUserId}. Error: ${feedbackError.message}`);
@@ -294,14 +317,31 @@ const createWebhookRoutes = (bot, dbPool, devDbPool, expectationQueue, expiratio
             logger.info(`[Router-${config.app.nodeEnv}] Webhook authorized.`);
             const webhookData = req.body;
             const { qrId } = webhookData;
-            if (!qrId) return res.status(400).send('Bad Request: Missing qrId.');
+            if (!qrId) {
+                logger.warn(`[Router-${config.app.nodeEnv}] Missing qrId in webhook data.`);
+                return res.status(400).send('Bad Request: Missing qrId.');
+            }
 
             if (config.app.nodeEnv === 'production') {
-                const { rows } = await dbPool.query('SELECT 1 FROM pix_transactions WHERE depix_api_entry_id = $1', [qrId]);
-                if (rows.length > 0) {
-                    logger.info(`[Router-Prod] Webhook for qrId '${qrId}' found in PROD DB. Processing locally.`);
-                    const result = await processWebhook(webhookData, dbPool, bot, expectationQueue, expirationQueue);
-                    return res.status(200).send(result.message);
+                // Verificar em ambas as tabelas: pix_transactions e verification_transactions
+                const { rows: pixRows } = await dbPool.query('SELECT 1 FROM pix_transactions WHERE depix_api_entry_id = $1', [qrId]);
+                const { rows: verificationRows } = await dbPool.query('SELECT 1 FROM verification_transactions WHERE depix_api_entry_id = $1', [qrId]);
+                
+                if (pixRows.length > 0 || verificationRows.length > 0) {
+                    logger.info(`[Router-Prod] Webhook for qrId '${qrId}' found in PROD DB (${pixRows.length > 0 ? 'pix_transactions' : 'verification_transactions'}). Processing in background.`);
+                    
+                    // Responder imediatamente para evitar timeout
+                    res.status(200).send('OK');
+                    
+                    // Processar em background
+                    setImmediate(async () => {
+                        try {
+                            await processWebhook(webhookData, dbPool, bot, expectationQueue, expirationQueue);
+                        } catch (bgError) {
+                            logger.error('[Router-Prod] Background processing error:', bgError);
+                        }
+                    });
+                    return;
                 }
 
                 if (!devDbPool) {
@@ -309,35 +349,57 @@ const createWebhookRoutes = (bot, dbPool, devDbPool, expectationQueue, expiratio
                     return res.status(404).send('Transaction not found in production.');
                 }
 
-                const { rows: devRows } = await devDbPool.query('SELECT 1 FROM pix_transactions WHERE depix_api_entry_id = $1', [qrId]);
-                if (devRows.length > 0) {
-                    logger.warn(`[Router-Prod] Webhook for qrId '${qrId}' NOT in PROD, found in DEV. Attempting to forward to ${config.developmentServerUrl}...`);
-                    try {
-                        await axios.post(`${config.developmentServerUrl}/webhooks/depix_payment`, webhookData, { headers: { 'Authorization': req.headers.authorization } });
-                        logger.info(`[Router-Prod] Webhook for qrId '${qrId}' forwarded successfully.`);
-                        return res.status(200).send('OK: Forwarded to development.');
-                    } catch (forwardError) {
-                        logger.error(`[Router-Prod] FAILED to forward webhook for qrId '${qrId}'.`);
-                        if (forwardError.response) {
-                            logger.error(`--> Details: Received HTTP ${forwardError.response.status} from development server.`);
-                            logger.error(`--> Response Data: ${JSON.stringify(forwardError.response.data)}`);
-                        } else if (forwardError.request) {
-                            logger.error(`--> Details: No response received from development server. This is likely a connection error.`);
-                            logger.error(`--> Error Code: ${forwardError.code}`);
-                        } else {
-                            logger.error('--> Details: Error setting up the forward request.');
-                            logger.error(`--> Message: ${forwardError.message}`);
+                const { rows: devPixRows } = await devDbPool.query('SELECT 1 FROM pix_transactions WHERE depix_api_entry_id = $1', [qrId]);
+                const { rows: devVerificationRows } = await devDbPool.query('SELECT 1 FROM verification_transactions WHERE depix_api_entry_id = $1', [qrId]);
+                
+                if (devPixRows.length > 0 || devVerificationRows.length > 0) {
+                    logger.warn(`[Router-Prod] Webhook for qrId '${qrId}' NOT in PROD, found in DEV. Forwarding to dev in background.`);
+                    
+                    // Responder imediatamente
+                    res.status(200).send('OK');
+                    
+                    // Fazer forward em background
+                    setImmediate(async () => {
+                        try {
+                            await axios.post(`${config.developmentServerUrl}/webhooks/depix_payment`, webhookData, { 
+                                headers: { 'Authorization': req.headers.authorization },
+                                timeout: 10000 // timeout de 10 segundos para o forward
+                            });
+                            logger.info(`[Router-Prod] Webhook for qrId '${qrId}' forwarded successfully.`);
+                        } catch (forwardError) {
+                            logger.error(`[Router-Prod] FAILED to forward webhook for qrId '${qrId}'.`);
+                            if (forwardError.response) {
+                                logger.error(`--> Details: Received HTTP ${forwardError.response.status} from development server.`);
+                                logger.error(`--> Response Data: ${JSON.stringify(forwardError.response.data)}`);
+                            } else if (forwardError.request) {
+                                logger.error(`--> Details: No response received from development server. This is likely a connection error.`);
+                                logger.error(`--> Error Code: ${forwardError.code}`);
+                            } else {
+                                logger.error('--> Details: Error setting up the forward request.');
+                                logger.error(`--> Message: ${forwardError.message}`);
+                            }
                         }
-                        return res.status(502).send('Error forwarding webhook to dev.');
-                    }
+                    });
+                    return;
                 }
 
                 logger.warn(`[Router-Prod] Webhook for qrId '${qrId}' not found in PROD or DEV databases. Discarding.`);
                 return res.status(404).send('Transaction not found in any environment.');
             } else {
-                logger.info(`[Router-Dev] Webhook received in DEV environment. Processing locally.`);
-                const result = await processWebhook(webhookData, dbPool, bot, expectationQueue, expirationQueue);
-                return res.status(200).send(result.message);
+                logger.info(`[Router-Dev] Webhook received in DEV environment. Processing in background.`);
+                
+                // Responder imediatamente
+                res.status(200).send('OK');
+                
+                // Processar em background
+                setImmediate(async () => {
+                    try {
+                        await processWebhook(webhookData, dbPool, bot, expectationQueue, expirationQueue);
+                    } catch (bgError) {
+                        logger.error('[Router-Dev] Background processing error:', bgError);
+                    }
+                });
+                return;
             }
         } catch (error) {
             logger.error('[Router] FATAL ERROR in webhook router logic:', error);

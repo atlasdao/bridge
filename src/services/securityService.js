@@ -116,6 +116,8 @@ async function createVerificationTransaction(dbPool, userId, qrCodeData, depixAp
             [userId, qrCodeData, depixApiEntryId]
         );
         
+        logger.info(`Verification transaction created for user ${userId} with depix_api_entry_id: ${depixApiEntryId}`);
+        
         return {
             success: true,
             verificationId: result.rows[0].verification_id

@@ -341,16 +341,26 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
             // Verificar status completo do usuário
             const userStatus = await securityService.getUserStatus(dbPool, userId);
             
-            // Verificar se já tem uma transação pendente
+            // Verificar se já tem uma transação pendente (não expirada)
             const pendingCheck = await dbPool.query(
-                'SELECT COUNT(*) as count FROM pix_transactions WHERE user_id = $1 AND payment_status = $2',
+                `SELECT depix_api_entry_id, created_at 
+                 FROM pix_transactions 
+                 WHERE user_id = $1 
+                   AND payment_status = $2 
+                   AND created_at > NOW() - INTERVAL '20 minutes'
+                 ORDER BY created_at DESC 
+                 LIMIT 1`,
                 [userId, 'PENDING']
             );
             
-            if (pendingCheck.rows[0].count > 0) {
+            if (pendingCheck.rows.length > 0) {
+                const pendingTx = pendingCheck.rows[0];
                 const message = `⚠️ **Você já tem um QR Code ativo**\n\n` +
                               `Complete ou cancele o pagamento anterior antes de gerar um novo\\.`;
-                const keyboard = Markup.inlineKeyboard([[Markup.button.callback('⬅️ Voltar', 'back_to_main_menu')]]);
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('❌ Cancelar pagamento anterior', `cancel_and_generate:${pendingTx.depix_api_entry_id}`)],
+                    [Markup.button.callback('⬅️ Voltar', 'back_to_main_menu')]
+                ]);
                 await ctx.editMessageText(message, { parse_mode: 'MarkdownV2', reply_markup: keyboard.reply_markup });
                 return;
             }
@@ -534,21 +544,45 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
                 return;
             }
             
-            // Verificar se há uma validação pendente
+            // Verificar se há uma validação pendente (não expirada)
             const pendingCheck = await dbPool.query(
-                'SELECT * FROM verification_transactions WHERE telegram_user_id = $1 AND verification_status = $2 ORDER BY created_at DESC LIMIT 1',
+                `SELECT depix_api_entry_id, created_at 
+                 FROM verification_transactions 
+                 WHERE telegram_user_id = $1 
+                   AND verification_status = $2 
+                   AND created_at > NOW() - INTERVAL '11 minutes'
+                 ORDER BY created_at DESC 
+                 LIMIT 1`,
                 [userId, 'PENDING']
             );
             
             if (pendingCheck.rows.length > 0) {
+                const pendingVerification = pendingCheck.rows[0];
+                const minutesElapsed = Math.floor((Date.now() - new Date(pendingVerification.created_at).getTime()) / 60000);
+                const minutesRemaining = 10 - minutesElapsed;
+                
                 const message = `⏳ **Você já tem uma validação em andamento\\!**\n\n` +
                                `Por favor, complete o pagamento de R\\$ 1,00 primeiro\\.\n\n` +
-                               `_Se o pagamento expirou, aguarde alguns minutos e tente novamente\\._`;
+                               `⏱️ Tempo restante: ${minutesRemaining} minutos\n\n` +
+                               `_Se você não conseguiu pagar, cancele e gere um novo QR Code\\._`;
                 
-                const keyboard = Markup.inlineKeyboard([[Markup.button.callback('⬅️ Voltar ao Menu', 'back_to_main_menu')]]);
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('❌ Cancelar e gerar novo', `cancel_verification:${pendingVerification.depix_api_entry_id}`)],
+                    [Markup.button.callback('⬅️ Voltar ao Menu', 'back_to_main_menu')]
+                ]);
                 await ctx.editMessageText(message, { parse_mode: 'MarkdownV2', reply_markup: keyboard.reply_markup });
                 return;
             }
+            
+            // Limpar verificações antigas expiradas
+            await dbPool.query(
+                `UPDATE verification_transactions 
+                 SET verification_status = 'EXPIRED', updated_at = NOW() 
+                 WHERE telegram_user_id = $1 
+                   AND verification_status = 'PENDING' 
+                   AND created_at <= NOW() - INTERVAL '11 minutes'`,
+                [userId]
+            );
             
             const validationMessage = `🔐 **Validação de Conta**\n\n` +
                                      `Para começar a usar o Bridge, precisamos validar sua conta\\. Este processo serve para:\n\n` +
@@ -696,9 +730,105 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
         }
     });
 
-    // Handler removido - não é mais necessário verificar status manualmente
+    // Handler para cancelar verificação pendente
+    bot.action(/^cancel_verification:(.+)$/, async (ctx) => {
+        try {
+            await ctx.answerCbQuery();
+            const depixApiEntryId = ctx.match[1];
+            const userId = ctx.from.id;
+            
+            // Verificar se esta verificação pertence ao usuário
+            const verificationCheck = await dbPool.query(
+                'SELECT * FROM verification_transactions WHERE depix_api_entry_id = $1 AND telegram_user_id = $2 AND verification_status = $3',
+                [depixApiEntryId, userId, 'PENDING']
+            );
+            
+            if (verificationCheck.rows.length === 0) {
+                await ctx.answerCbQuery('❌ Verificação não encontrada ou já processada', true);
+                return;
+            }
+            
+            // Marcar como cancelada
+            await dbPool.query(
+                'UPDATE verification_transactions SET verification_status = $1, updated_at = NOW() WHERE depix_api_entry_id = $2',
+                ['CANCELLED', depixApiEntryId]
+            );
+            
+            // Tentar apagar mensagem do QR se existir
+            const qrMessageId = verificationCheck.rows[0].qr_code_message_id;
+            if (qrMessageId) {
+                try {
+                    await bot.telegram.deleteMessage(userId, qrMessageId);
+                } catch (e) {
+                    // Ignorar se não conseguir apagar
+                }
+            }
+            
+            logger.info(`[cancel_verification] User ${userId} cancelled verification ${depixApiEntryId}`);
+            
+            // Redirecionar de volta para o início da validação
+            const validationMessage = `🔐 **Validação de Conta**\n\n` +
+                                     `Para começar a usar o Bridge, precisamos validar sua conta\\. Este processo serve para:\n\n` +
+                                     `✅ Confirmar que você não é um robô\n` +
+                                     `✅ Proteger contra abusos e fraudes\n` +
+                                     `✅ Liberar limites progressivos de transação\n\n` +
+                                     `Ao fazer o pagamento de R\\$ 1,00 você valida sua conta, receberá R\\$ 0,01 e desbloqueará o limite diário de 50 reais\\. Esse limite irá aumentando conforme você vai comprando\\.\n\n` +
+                                     `Deseja continuar com a validação?`;
+            
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('✅ Sim, validar minha conta', 'confirm_validation')],
+                [Markup.button.callback('❌ Cancelar', 'back_to_main_menu')]
+            ]);
+            
+            await ctx.editMessageText(validationMessage, { parse_mode: 'MarkdownV2', reply_markup: keyboard.reply_markup });
+            
+        } catch (error) {
+            logError('cancel_verification', error, ctx);
+            await ctx.answerCbQuery('❌ Erro ao cancelar verificação', true);
+        }
+    });
     
-    // Handler para cancelar QR code
+    // Handler para cancelar pagamento anterior
+    bot.action(/^cancel_and_generate:(.+)$/, async (ctx) => {
+        try {
+            await ctx.answerCbQuery();
+            const qrId = ctx.match[1];
+            const userId = ctx.from.id;
+            
+            // Verificar se este QR pertence ao usuário
+            const txCheck = await dbPool.query(
+                'SELECT * FROM pix_transactions WHERE depix_api_entry_id = $1 AND user_id = $2 AND payment_status = $3',
+                [qrId, userId, 'PENDING']
+            );
+            
+            if (txCheck.rows.length === 0) {
+                await ctx.answerCbQuery('❌ Transação não encontrada ou já processada', true);
+                return;
+            }
+            
+            // Marcar como cancelado
+            await dbPool.query(
+                'UPDATE pix_transactions SET payment_status = $1, updated_at = NOW() WHERE depix_api_entry_id = $2',
+                ['CANCELLED', qrId]
+            );
+            
+            // Informar que o pagamento foi cancelado e voltar ao menu
+            const message = '✅ **Pagamento anterior cancelado com sucesso**\n\n' +
+                           'Agora você pode gerar um novo QR Code se desejar\\.';
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('💵 Receber Pix', 'receive_pix_start')],
+                [Markup.button.callback('⬅️ Voltar ao Menu', 'back_to_main_menu')]
+            ]);
+            
+            await ctx.editMessageText(message, { parse_mode: 'MarkdownV2', reply_markup: keyboard.reply_markup });
+            
+        } catch (error) {
+            logError('cancel_and_generate', error, ctx);
+            await ctx.answerCbQuery('❌ Erro ao processar', true);
+        }
+    });
+    
+    // Handler para cancelar QR code (mantido para compatibilidade com botões antigos)
     bot.action(/^cancel_qr:(.+)$/, async (ctx) => {
         try {
             await ctx.answerCbQuery();
@@ -718,7 +848,7 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
             
             // Marcar como cancelado
             await dbPool.query(
-                'UPDATE pix_transactions SET payment_status = $1 WHERE depix_api_entry_id = $2',
+                'UPDATE pix_transactions SET payment_status = $1, updated_at = NOW() WHERE depix_api_entry_id = $2',
                 ['CANCELLED', qrId]
             );
             
@@ -734,7 +864,14 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
                 );
             }
             
-            await ctx.reply('QR Code cancelado. Use o menu para gerar um novo quando desejar.', mainMenuKeyboardObj);
+            // Enviar mensagem de confirmação e mostrar menu para novo depósito
+            const message = `✅ **QR Code cancelado com sucesso\!**\n\n` +
+                          `Agora você pode gerar um novo QR Code quando desejar\\.`;
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('💸 Gerar Novo Depósito', 'receive_pix_start')],
+                [Markup.button.callback('⬅️ Voltar ao Menu', 'back_to_main_menu')]
+            ]);
+            await ctx.reply(message, { parse_mode: 'MarkdownV2', ...keyboard });
             
         } catch (error) {
             logError('cancel_qr', error, ctx);

@@ -85,6 +85,7 @@ const generatePixForDeposit = async (amountInCents, userLiquidAddress, webhookUr
             throw new Error(data.response.errorMessage);
         }
         if (data.response?.qrCopyPaste && data.response?.qrImageUrl && data.response?.id) {
+            logger.info(`DePix deposit created with ID: ${data.response.id}`);
             return data.response; 
         }
         if (data.async === true) {
