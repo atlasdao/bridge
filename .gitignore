@@ -217,6 +217,21 @@ init_database.sql
 *.backup.*
 src/**/*.backup
 
+# Arquivos de segurança e documentação sensível
+# ----------------------------------------------
+fix_gamification_breach.sql
+*gamification_breach*
+*SECURITY_FIX*
+SECURITY_*.md
+security_*.sql
+breach_*.sql
+fix_*.sql
+*_fix.sql
+vulns/
+vulnerabilities/
+security-reports/
+logs_backup_*
+
 # Monitoramento e métricas
 # ------------------------
 .nyc_output/
