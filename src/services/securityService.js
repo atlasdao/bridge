@@ -1,6 +1,56 @@
 const logger = require('../core/logger');
 
 /**
+ * Verifica se um usuário está na blacklist unificada
+ * @param {Object} dbPool - Pool de conexão do banco de dados
+ * @param {Object} params - Parâmetros para verificação
+ * @returns {Object} - { isBanned: boolean, reason: string, banType: string, expiresAt: Date, matchedField: string }
+ */
+async function checkBlacklist(dbPool, params) {
+    try {
+        const result = await dbPool.query(
+            `SELECT * FROM check_user_banned($1, $2, $3, $4, $5, $6)`,
+            [
+                params.telegram_id || null,
+                params.telegram_username || null,
+                params.cpf_cnpj || null,
+                params.email || null,
+                params.phone || null,
+                params.full_name || null
+            ]
+        );
+
+        if (result.rows.length === 0) {
+            return {
+                isBanned: false,
+                reason: null,
+                banType: null,
+                expiresAt: null,
+                matchedField: null
+            };
+        }
+
+        const ban = result.rows[0];
+        return {
+            isBanned: ban.is_banned,
+            reason: ban.ban_reason,
+            banType: ban.ban_type,
+            expiresAt: ban.expires_at,
+            matchedField: ban.matched_field
+        };
+    } catch (error) {
+        logger.error(`Error checking blacklist: ${error.message}`);
+        return {
+            isBanned: false,
+            reason: null,
+            banType: null,
+            expiresAt: null,
+            matchedField: null
+        };
+    }
+}
+
+/**
  * Verifica se o usuário pode realizar uma transação
  * @param {Object} dbPool - Pool de conexão do banco de dados
  * @param {Number} userId - ID do usuário no Telegram
@@ -9,26 +59,10 @@ const logger = require('../core/logger');
  */
 async function checkUserCanTransact(dbPool, userId, amount) {
     try {
-        // Chamar função SQL que faz todas as verificações
-        const result = await dbPool.query(
-            'SELECT * FROM can_user_transact($1, $2)',
-            [userId, amount]
-        );
-        
-        if (result.rows.length === 0) {
-            return {
-                canTransact: false,
-                reason: 'Erro ao verificar permissões',
-                userInfo: null
-            };
-        }
-        
-        const check = result.rows[0];
-        
-        // Buscar informações adicionais do usuário
+        // Primeiro buscar informações do usuário
         const userResult = await dbPool.query(
-            `SELECT 
-                telegram_user_id,
+            `SELECT
+                telegram_id,
                 telegram_username,
                 liquid_address,
                 is_verified,
@@ -39,12 +73,58 @@ async function checkUserCanTransact(dbPool, userId, amount) {
                 daily_used_brl,
                 is_banned,
                 (daily_limit_brl - daily_used_brl) as available_today
-            FROM users 
-            WHERE telegram_user_id = $1`,
+            FROM users
+            WHERE telegram_id = $1`,
             [userId]
         );
-        
+
         const userInfo = userResult.rows[0] || null;
+
+        // Verificar blacklist unificada
+        const blacklistCheck = await checkBlacklist(dbPool, {
+            telegram_id: userId,
+            telegram_username: userInfo?.telegram_username,
+            cpf_cnpj: userInfo?.payer_cpf_cnpj,
+            full_name: userInfo?.payer_name
+        });
+
+        if (blacklistCheck.isBanned) {
+            // Se está na blacklist, atualizar o campo is_banned no usuário
+            if (userInfo && !userInfo.is_banned) {
+                await dbPool.query(
+                    'UPDATE users SET is_banned = true WHERE telegram_id = $1',
+                    [userId]
+                );
+            }
+
+            let banMessage = `Usuário bloqueado: ${blacklistCheck.reason}`;
+            if (blacklistCheck.banType === 'temporary' && blacklistCheck.expiresAt) {
+                const expiresDate = new Date(blacklistCheck.expiresAt);
+                banMessage += ` (até ${expiresDate.toLocaleDateString('pt-BR')})`;
+            }
+
+            return {
+                canTransact: false,
+                reason: banMessage,
+                userInfo: userInfo
+            };
+        }
+
+        // Chamar função SQL que faz as outras verificações
+        const result = await dbPool.query(
+            'SELECT * FROM can_user_transact($1, $2)',
+            [userId, amount]
+        );
+
+        if (result.rows.length === 0) {
+            return {
+                canTransact: false,
+                reason: 'Erro ao verificar permissões',
+                userInfo: null
+            };
+        }
+
+        const check = result.rows[0];
         
         return {
             canTransact: check.can_transact,
@@ -189,7 +269,7 @@ async function processVerificationPayment(dbPool, depixApiEntryId, payerName, pa
                 reputation_level = 1,
                 daily_limit_brl = 50,
                 updated_at = NOW()
-            WHERE telegram_user_id = $3`,
+            WHERE telegram_id = $3`,
             [payerName, payerCpfCnpj, verification.telegram_user_id]
         );
         
@@ -231,7 +311,7 @@ async function updateDailyUsage(dbPool, userId, amount) {
             `UPDATE users 
             SET daily_used_brl = daily_used_brl + $1,
                 updated_at = NOW()
-            WHERE telegram_user_id = $2`,
+            WHERE telegram_id = $2`,
             [amount, userId]
         );
         
@@ -273,7 +353,7 @@ async function getUserStatus(dbPool, userId) {
                 END as actual_daily_used
             FROM users u
             LEFT JOIN reputation_levels_config rlc ON u.reputation_level = rlc.level
-            WHERE u.telegram_user_id = $1`,
+            WHERE u.telegram_id = $1`,
             [userId]
         );
         
@@ -290,6 +370,7 @@ async function getUserStatus(dbPool, userId) {
 }
 
 module.exports = {
+    checkBlacklist,
     checkUserCanTransact,
     checkAndUpgradeReputation,
     createVerificationTransaction,

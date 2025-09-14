@@ -6,6 +6,9 @@ const config = require('../core/config');
 const logger = require('../core/logger');
 const { escapeMarkdownV2 } = require('../utils/escapeMarkdown');
 const securityService = require('../services/securityService');
+const LogSanitizer = require('../utils/logSanitizer');
+
+const secureLogger = LogSanitizer.createSecureLogger();
 
 const safeCompare = (a, b) => {
     if (typeof a !== 'string' || typeof b !== 'string') return false;
@@ -16,16 +19,19 @@ const safeCompare = (a, b) => {
 };
 
 const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expirationQueue) => {
-    // Log completo dos dados recebidos
-    logger.info(`[Process] Full webhook data received:`, JSON.stringify(webhookData));
+    // Log sanitizado dos dados recebidos
+    secureLogger.info(`[Process] Webhook data received:`, webhookData);
     
     // DePix envia o CPF/CNPJ como payerTaxNumber
     const { blockchainTxID, qrId, status, payerName, payerTaxNumber } = webhookData;
     const payerCpfCnpj = payerTaxNumber; // Mapear para o nome esperado
     
-    // Log dos dados do pagador se disponíveis
+    // Log sanitizado dos dados do pagador
     if (payerName || payerCpfCnpj) {
-        logger.info(`[Process] Payer info received - Name: ${payerName || 'N/A'}, CPF/CNPJ: ${payerCpfCnpj || 'N/A'}`);
+        secureLogger.info(`[Process] Payer info received`, {
+            payerName: payerName || 'N/A',
+            payerCpfCnpj: payerCpfCnpj || 'N/A'
+        });
     }
 
     try {
@@ -73,17 +79,17 @@ const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expira
                     const successMessage = `✅ **Conta Validada com Sucesso\\!**\n\n` +
                                          `⭐ Nível: 1\n` +
                                          `💰 Limite Diário: R\\$ 50,00\n\n` +
-                                         `🎁 Você receberá 0,01 DEPIX de recompensa em breve\\!\n\n` +
+                                         `📈 Você pode aumentar seu limite diário conforme sobe de nível\\.\n` +
+                                         `No Nível 10, o limite é de R\\$ 6\\.020,00 por dia\\!\n\n` +
                                          `Agora você pode usar todas as funcionalidades do Bridge\\!`;
-                    
+
                     await bot.telegram.sendMessage(result.userId, successMessage, { parse_mode: 'MarkdownV2' });
                     
                     // Enviar menu principal imediatamente
                     const mainMenuKeyboard = Markup.inlineKeyboard([
-                        [Markup.button.callback('💸 Converter PIX em DePix', 'receive_pix_start')],
+                        [Markup.button.callback('💸 Comprar Depix Liquid', 'receive_pix_start')],
                         [Markup.button.callback('📊 Meu Status', 'user_status')],
                         [Markup.button.callback('💼 Minha Carteira', 'my_wallet')],
-                        [Markup.button.callback('📈 Histórico', 'transaction_history')],
                         [Markup.button.callback('ℹ️ Sobre o Bridge', 'about_bridge')],
                         [Markup.button.url('💬 Comunidade Atlas', 'https://t.me/+zVuRYh5nsdE2MTYx')]
                     ]);
@@ -244,58 +250,119 @@ const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expira
 
     let userMessage;
     if (newPaymentStatus === 'PAID') {
-        userMessage = `✅ Pagamento Pix de R\\$ ${escapeMarkdownV2(Number(requestedAmountBRL).toFixed(2))} confirmado\\!\nSeus DePix foram enviados\\.\n`;
-        if (blockchainTxID) userMessage += `ID da Transação Liquid: \`${escapeMarkdownV2(blockchainTxID)}\``;
+        userMessage = `✅ **Transação Concluída\\!**\n\n` +
+                     `💰 Valor: R\\$ ${escapeMarkdownV2(Number(requestedAmountBRL).toFixed(2))}\n`;
+        if (blockchainTxID) userMessage += `🔗 Liquid TX: \`${escapeMarkdownV2(blockchainTxID)}\`\n\n`;
+        userMessage += `Obrigado por usar o Atlas Bridge\\!`;
     } else if (newPaymentStatus === 'REFUNDED') {
-        userMessage = `⚠️ **Pagamento Reembolsado**\n\n` +
-                    `O pagamento de R\\$ ${escapeMarkdownV2(Number(requestedAmountBRL).toFixed(2))} foi reembolsado\\.\n\n` +
+        userMessage = `⚠️ **Pagamento será reembolsado**\n\n` +
+                    `O pagamento de R\\$ ${escapeMarkdownV2(Number(requestedAmountBRL).toFixed(2))} será reembolsado\\.\n\n` +
                     `**Motivo:** ${escapeMarkdownV2(refundReason || 'CPF/CNPJ diferente do cadastrado')}\n\n` +
                     `⚠️ Você deve pagar sempre com o mesmo CPF/CNPJ cadastrado: **${escapeMarkdownV2(userInfo.payer_cpf_cnpj || 'N/A')}**\n\n` +
-                    `Para receber de múltiplos CPF/CNPJ, entre em contato com o suporte para habilitar o modo comércio\\.`;
+                    `O valor retornará à sua conta em até 24 horas\\.`;
     } else {
         userMessage = `❌ Falha no pagamento Pix de R\\$ ${escapeMarkdownV2(Number(requestedAmountBRL).toFixed(2))}\\.\nStatus da API DePix: ${escapeMarkdownV2(status)}\\. Se o valor foi debitado, entre em contato com o suporte\\.`;
     }
 
     try {
-        await bot.telegram.sendMessage(recipientTelegramUserId, userMessage, { parse_mode: 'MarkdownV2' });
+        // Se o pagamento foi confirmado, enviar com o menu principal
+        if (newPaymentStatus === 'PAID') {
+            const mainMenuKeyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('💸 Comprar Depix Liquid', 'receive_pix_start')],
+                [Markup.button.callback('📊 Meu Status', 'user_status')],
+                [Markup.button.callback('💼 Minha Carteira', 'my_wallet')],
+                [Markup.button.callback('ℹ️ Sobre o Bridge', 'about_bridge')],
+                [Markup.button.url('💬 Comunidade Atlas', 'https://t.me/+zVuRYh5nsdE2MTYx')]
+            ]);
+
+            await bot.telegram.sendMessage(recipientTelegramUserId, userMessage, {
+                parse_mode: 'MarkdownV2',
+                reply_markup: mainMenuKeyboard.reply_markup
+            });
+        } else {
+            // Para outros status, enviar sem menu
+            await bot.telegram.sendMessage(recipientTelegramUserId, userMessage, { parse_mode: 'MarkdownV2' });
+        }
+
         logger.info(`[Process] Notification SENT to user ${recipientTelegramUserId} for transaction ${ourTransactionId}`);
 
         if (newPaymentStatus === 'PAID') {
-            // Enviar menu principal após pagamento bem-sucedido
-            setTimeout(async () => {
-                try {
-                    const mainMenuKeyboard = Markup.inlineKeyboard([
-                        [Markup.button.callback('💸 Converter PIX em DePix', 'receive_pix_start')],
-                        [Markup.button.callback('📊 Meu Status', 'user_status')],
-                        [Markup.button.callback('💼 Minha Carteira', 'my_wallet')],
-                        [Markup.button.callback('📈 Histórico', 'transaction_history')],
-                        [Markup.button.callback('ℹ️ Sobre o Bridge', 'about_bridge')],
-                        [Markup.button.url('💬 Comunidade Atlas', 'https://t.me/+zVuRYh5nsdE2MTYx')]
-                    ]);
-                    
-                    const menuMessage = `🎯 **Transação Concluída\\!**\n\n` +
-                                      `O que deseja fazer agora?`;
-                    
-                    await bot.telegram.sendMessage(recipientTelegramUserId, menuMessage, {
-                        parse_mode: 'MarkdownV2',
-                        reply_markup: mainMenuKeyboard.reply_markup
-                    });
-                    logger.info(`[Process] Main menu sent to user ${recipientTelegramUserId}.`);
-                } catch (menuError) {
-                    logger.error(`[Process] Failed to send main menu: ${menuError.message}`);
+            // Verificar progresso para próximo nível e enviar mensagem motivacional
+            const userLevel = await dbPool.query(
+                'SELECT reputation_level FROM users WHERE telegram_id = $1',
+                [recipientTelegramUserId]
+            );
+
+            if (userLevel.rows.length > 0 && userLevel.rows[0].reputation_level < 10) {
+                const currentLevel = userLevel.rows[0].reputation_level;
+                const nextLevelData = await dbPool.query(
+                    'SELECT * FROM reputation_levels_config WHERE level = $1',
+                    [currentLevel + 1]
+                );
+
+                if (nextLevelData.rows.length > 0) {
+                    const nextLevel = nextLevelData.rows[0];
+
+                    // Buscar estatísticas atualizadas do usuário
+                    const userStatsQuery = await dbPool.query(
+                        `SELECT
+                            COUNT(*) as transaction_count,
+                            COALESCE(SUM(requested_brl_amount), 0) as total_volume
+                         FROM pix_transactions
+                         WHERE user_id = $1 AND payment_status IN ('PAID', 'CONFIRMED')`,
+                        [recipientTelegramUserId]
+                    );
+
+                    const userStats = userStatsQuery.rows[0];
+                    const currentTxCount = parseInt(userStats.transaction_count);
+                    const currentVolume = parseFloat(userStats.total_volume);
+
+                    // Calcular progresso percentual
+                    const txProgress = (currentTxCount / nextLevel.min_transactions_for_upgrade) * 100;
+                    const volumeProgress = (currentVolume / nextLevel.min_volume_for_upgrade) * 100;
+
+                    // Se está próximo de subir de nível (>70% em qualquer critério)
+                    if (txProgress >= 70 || volumeProgress >= 70) {
+                        const txNeeded = Math.max(0, nextLevel.min_transactions_for_upgrade - currentTxCount);
+                        const volumeNeeded = Math.max(0, nextLevel.min_volume_for_upgrade - currentVolume);
+
+                        let levelUpMessage = '';
+
+                        // Determinar qual está mais próximo
+                        if (txProgress >= volumeProgress && txNeeded > 0) {
+                            levelUpMessage = `🚀 **Falta apenas ${txNeeded} transação${txNeeded > 1 ? '\\(ões\\)' : ''} para o Nível ${currentLevel + 1}\\!**\n` +
+                                           `💰 Novo limite: R\\$ ${escapeMarkdownV2(Number(nextLevel.daily_limit_brl).toFixed(2))}/dia`;
+                        } else if (volumeNeeded > 0) {
+                            levelUpMessage = `🚀 **Falta apenas R\\$ ${escapeMarkdownV2(volumeNeeded.toFixed(2))} em volume para o Nível ${currentLevel + 1}\\!**\n` +
+                                           `💰 Novo limite: R\\$ ${escapeMarkdownV2(Number(nextLevel.daily_limit_brl).toFixed(2))}/dia`;
+                        }
+
+                        if (levelUpMessage) {
+                            // Enviar mensagem motivacional separada após 1 segundo
+                            setTimeout(async () => {
+                                try {
+                                    await bot.telegram.sendMessage(recipientTelegramUserId, levelUpMessage, { parse_mode: 'MarkdownV2' });
+                                    logger.info(`[Process] Level up motivation sent to user ${recipientTelegramUserId}.`);
+                                } catch (levelError) {
+                                    logger.error(`[Process] Failed to send level up message: ${levelError.message}`);
+                                }
+                            }, 1000);
+                        }
+                    }
                 }
-            }, 1500);
-            
+            }
+
+            // Enviar mensagem de feedback após alguns segundos
             const feedbackMessage = "Ajude a Atlas a crescer e manter um serviço competitivo! Avalie nosso serviço em https://trustscore.space/reviews.html - sua opinião é muito importante para nós.";
-            
+
             setTimeout(async () => {
                 try {
                     await bot.telegram.sendMessage(recipientTelegramUserId, feedbackMessage);
-                    logger.info(`[Process] Donation request sent to user ${recipientTelegramUserId}.`);
+                    logger.info(`[Process] Feedback request sent to user ${recipientTelegramUserId}.`);
                 } catch (feedbackError) {
-                    logger.error(`[Process] FAILED to send donation request to user ${recipientTelegramUserId}. Error: ${feedbackError.message}`);
+                    logger.error(`[Process] FAILED to send feedback request to user ${recipientTelegramUserId}. Error: ${feedbackError.message}`);
                 }
-            }, 4000);
+            }, 3000);
         }
     } catch (notifyError) {
         logger.error(`[Process] FAILED to send Telegram notification to user ${recipientTelegramUserId}. Error: ${notifyError.message}`);
