@@ -2,12 +2,16 @@ const config = require('./core/config');
 const logger = require('./core/logger');
 const { Telegraf } = require('telegraf');
 const express = require('express');
+const https = require('https');
 const { Pool } = require('pg');
 const IORedis = require('ioredis');
 const { registerBotHandlers } = require('./bot/handlers');
 const { createWebhookRoutes } = require('./routes/webhookRoutes');
 const { initializeExpectationWorker, expectationMessageQueue } = require('./queues/expectationMessageQueue');
 const { initializeExpirationWorker, expirationQueue } = require('./queues/expirationQueue');
+const SecurityMiddleware = require('./middleware/security');
+const SecurityMonitor = require('./services/securityMonitor');
+const depixMonitor = require('./services/depixMonitor');
 
 logger.info('--------------------------------------------------');
 logger.info('--- Starting Atlas Bridge Bot ---');
@@ -27,6 +31,11 @@ if (config.app.nodeEnv === 'production') {
 
 const dbPool = new Pool({
     connectionString: config.supabase.databaseUrl,
+});
+
+// Configurar timezone para Brasília em todas as conexões
+dbPool.on('connect', (client) => {
+    client.query("SET TIME ZONE 'America/Sao_Paulo'");
 });
 
 dbPool.query('SELECT NOW() AS now', (err, res) => {
@@ -49,24 +58,97 @@ const mainRedisConnection = new IORedis({
 mainRedisConnection.on('connect', () => logger.info(`Main Redis connection successful to DB ${config.redis.db}.`));
 mainRedisConnection.on('error', (err) => logger.error(`Main Redis connection error to DB ${config.redis.db}:`, err.message));
 
-const bot = new Telegraf(config.telegram.botToken);
+const httpsAgent = new https.Agent({
+    keepAlive: true,
+    family: 4,
+    rejectUnauthorized: true,
+    timeout: 30000
+});
+
+const bot = new Telegraf(config.telegram.botToken, {
+    telegram: {
+        apiRoot: 'https://api.telegram.org',
+        webhookReply: false,
+        agent: httpsAgent,
+        apiMode: 'bot'
+    },
+    handlerTimeout: 90000
+});
 const getBotInstance = () => bot;
 
 registerBotHandlers(bot, dbPool, expectationMessageQueue, expirationQueue);
 initializeExpectationWorker(dbPool, getBotInstance);
 initializeExpirationWorker(dbPool, getBotInstance);
 
-bot.launch().then(() => logger.info('Telegram Bot started successfully via polling.')).catch(err => {
-    logger.error('Error starting Telegram Bot:', err);
-    process.exit(1);
-});
+// Iniciar o monitor do DePix
+depixMonitor.setDbPool(dbPool);
+depixMonitor.start();
+
+// Tentativa de conectar ao Telegram com retry e fallback
+const disableTelegram = process.env.DISABLE_TELEGRAM === 'true';
+
+if (disableTelegram) {
+    logger.warn('Telegram Bot is DISABLED via DISABLE_TELEGRAM environment variable');
+    logger.info('Application running in webhook-only mode');
+} else {
+    const maxRetries = 3;
+    let retryCount = 0;
+
+    const launchBot = async () => {
+        try {
+            await bot.launch({
+                webhook: undefined,
+                dropPendingUpdates: true,
+                allowedUpdates: []
+            });
+            logger.info('Telegram Bot started successfully via polling.');
+        } catch (err) {
+            retryCount++;
+            logger.error(`Error starting Telegram Bot (attempt ${retryCount}/${maxRetries}):`, err.message);
+
+            if (retryCount < maxRetries) {
+                logger.info(`Retrying in 5 seconds...`);
+                setTimeout(launchBot, 5000);
+            } else {
+                logger.error('Failed to connect to Telegram after maximum retries');
+                logger.warn('Continuing without Telegram bot - webhooks will still work');
+                logger.info('To disable this warning, set DISABLE_TELEGRAM=true in .env');
+            }
+        }
+    };
+
+    launchBot();
+}
 
 const app = express();
+
+// Middlewares de segurança
+app.use(SecurityMiddleware.forceHTTPS);
+app.use(SecurityMiddleware.setupHelmet());
+app.use(SecurityMiddleware.sanitizeHeaders);
+app.use(SecurityMiddleware.securityMonitor);
+app.use(SecurityMiddleware.requestTimeout(30));
+
+// Rate limiters
+const rateLimiters = SecurityMiddleware.getRateLimiters();
+app.use(rateLimiters.general);
+
 app.use(express.json());
 app.set('trust proxy', 1);
 
+// Monitor de segurança
+const securityMonitor = new SecurityMonitor(dbPool, mainRedisConnection);
+app.use(securityMonitor.middleware());
+
+// Eventos de segurança
+securityMonitor.on('highRiskDetected', (data) => {
+    logger.error('HIGH RISK SECURITY EVENT:', data);
+    // Aqui você pode adicionar notificações para admin
+});
+
 app.get('/', (req, res) => res.status(200).send(`Atlas Bridge Bot App is alive! [ENV: ${config.app.nodeEnv}]`));
-app.use('/webhooks', createWebhookRoutes(bot, dbPool, devDbPool, expectationMessageQueue, expirationQueue));
+// Rate limiter específico para webhooks
+app.use('/webhooks', rateLimiters.webhook, createWebhookRoutes(bot, dbPool, devDbPool, expectationMessageQueue, expirationQueue));
 
 // CORREÇÃO: Especificar o host '0.0.0.0' para garantir que o servidor
 // escute em todas as interfaces de rede, incluindo localhost.
@@ -79,10 +161,38 @@ const gracefulShutdown = async (signal) => {
     logger.info(`\nReceived ${signal}. Shutting down gracefully...`);
     server.close(async () => {
         logger.info('HTTP server closed.');
-        try { if (bot && typeof bot.stop === 'function') { bot.stop(signal); logger.info('Telegram bot polling stopped.'); } } catch (err) { logger.error('Error stopping Telegram bot:', err.message); }
-        try { if (expectationMessageQueue) await expectationMessageQueue.close(); if (expirationQueue) await expirationQueue.close(); logger.info('BullMQ queues closed.'); } catch(err) { logger.error('Error closing BullMQ queues:', err.message); }
-        try { await dbPool.end(); logger.info('Primary Database pool closed.'); if (devDbPool) await devDbPool.end(); } catch (err) { logger.error('Error closing database pool:', err.message); }
-        if (mainRedisConnection && mainRedisConnection.status === 'ready') { await mainRedisConnection.quit(); logger.info('Main Redis connection closed.'); }
+        try {
+            if (bot && typeof bot.stop === 'function' && !disableTelegram) {
+                bot.stop(signal);
+                logger.info('Telegram bot polling stopped.');
+            }
+        } catch (err) {
+            logger.error('Error stopping Telegram bot:', err.message);
+        }
+        try {
+            depixMonitor.stop();
+            logger.info('DePix monitor stopped.');
+        } catch (err) {
+            logger.error('Error stopping DePix monitor:', err.message);
+        }
+        try {
+            if (expectationMessageQueue) await expectationMessageQueue.close();
+            if (expirationQueue) await expirationQueue.close();
+            logger.info('BullMQ queues closed.');
+        } catch(err) {
+            logger.error('Error closing BullMQ queues:', err.message);
+        }
+        try {
+            await dbPool.end();
+            logger.info('Primary Database pool closed.');
+            if (devDbPool) await devDbPool.end();
+        } catch (err) {
+            logger.error('Error closing database pool:', err.message);
+        }
+        if (mainRedisConnection && mainRedisConnection.status === 'ready') {
+            await mainRedisConnection.quit();
+            logger.info('Main Redis connection closed.');
+        }
         logger.info('Shutdown complete.');
         process.exit(0);
     });

@@ -70,7 +70,7 @@ const ping = async () => {
     }
 };
 
-const generatePixForDeposit = async (amountInCents, userLiquidAddress, webhookUrl) => {
+const generatePixForDeposit = async (amountInCents, userLiquidAddress, webhookUrl, userInfo = {}) => {
     if (!userLiquidAddress || !webhookUrl) {
         throw new Error('User Liquid address and Webhook URL are required.');
     }
@@ -79,6 +79,13 @@ const generatePixForDeposit = async (amountInCents, userLiquidAddress, webhookUr
         depixAddress: userLiquidAddress,
         callback_url: webhookUrl,
     };
+
+    // Adicionar informações do pagador se disponíveis
+    if (userInfo.payerName && userInfo.payerDocument) {
+        payload.payerName = userInfo.payerName;
+        payload.payerTaxNumber = userInfo.payerDocument; // CPF ou CNPJ
+        logger.info('Including payer info in PIX QR code generation');
+    }
     try {
         const data = await depixApi.post('/deposit', payload); 
         if (data.response?.errorMessage) {
