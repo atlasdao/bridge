@@ -169,7 +169,8 @@ const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expira
     let newPaymentStatus;
     if (status === 'depix_sent') {
         if (cpfCnpjValid) {
-            newPaymentStatus = 'PAID';
+            // Changed to CONFIRMED to properly trigger the database trigger
+            newPaymentStatus = 'CONFIRMED';
             
             // Atualizar uso diário se o pagamento foi bem-sucedido
             await securityService.updateDailyUsage(dbPool, recipientTelegramUserId, requestedAmountBRL);
@@ -249,7 +250,7 @@ const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expira
     }
 
     let userMessage;
-    if (newPaymentStatus === 'PAID') {
+    if (newPaymentStatus === 'CONFIRMED') {
         userMessage = `✅ **Transação Concluída\\!**\n\n` +
                      `💰 Valor: R\\$ ${escapeMarkdownV2(Number(requestedAmountBRL).toFixed(2))}\n`;
         if (blockchainTxID) userMessage += `🔗 Liquid TX: \`${escapeMarkdownV2(blockchainTxID)}\`\n\n`;
@@ -266,7 +267,7 @@ const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expira
 
     try {
         // Se o pagamento foi confirmado, enviar com o menu principal
-        if (newPaymentStatus === 'PAID') {
+        if (newPaymentStatus === 'CONFIRMED') {
             const mainMenuKeyboard = Markup.inlineKeyboard([
                 [Markup.button.callback('💸 Comprar Depix Liquid', 'receive_pix_start')],
                 [Markup.button.callback('📊 Meu Status', 'user_status')],
@@ -286,7 +287,7 @@ const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expira
 
         logger.info(`[Process] Notification SENT to user ${recipientTelegramUserId} for transaction ${ourTransactionId}`);
 
-        if (newPaymentStatus === 'PAID') {
+        if (newPaymentStatus === 'CONFIRMED') {
             // Verificar progresso para próximo nível e enviar mensagem motivacional
             const userLevel = await dbPool.query(
                 'SELECT reputation_level FROM users WHERE telegram_id = $1',
@@ -309,7 +310,7 @@ const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expira
                             COUNT(*) as transaction_count,
                             COALESCE(SUM(requested_brl_amount), 0) as total_volume
                          FROM pix_transactions
-                         WHERE user_id = $1 AND payment_status IN ('PAID', 'CONFIRMED')`,
+                         WHERE user_id = $1 AND payment_status IN ('PAID', 'CONFIRMED', 'COMPLETED')`,
                         [recipientTelegramUserId]
                     );
 

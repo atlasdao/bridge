@@ -67,6 +67,7 @@ keys/
 *.crt
 *.p12
 *.pfx
+/scripts
 
 # Build e distribuição
 # --------------------
@@ -216,6 +217,23 @@ init_database.sql
 *.js.backup
 *.backup.*
 src/**/*.backup
+
+# Migration files with potential production data
+migrations/*-PRODUCTION.sql
+migrations/*-production-*.sql
+migrations/backup-*.sql
+migrations/prod-*.sql
+
+# Test migration scripts
+migrations/*-test.sql
+migrations/*-local.sql
+apply-*.js
+
+# Deployment files with sensitive info
+DEPLOYMENT.md
+deployment-*.md
+deploy-*.sh
+production-*.md
 
 # Arquivos de segurança e documentação sensível
 # ----------------------------------------------

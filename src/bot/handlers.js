@@ -179,7 +179,7 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
 
         logger.info(`User ${telegramUserId} (${telegramUsername}) started the bot.`);
         try {
-            const { rows } = await dbPool.query('SELECT liquid_address, telegram_username FROM users WHERE telegram_id = $1', [telegramUserId]);
+            const { rows } = await dbPool.query('SELECT liquid_address, telegram_username FROM users WHERE telegram_user_id = $1', [telegramUserId]);
             if (rows.length > 0 && rows[0].liquid_address) {
                 await sendMainMenu(ctx, 'Bem-vindo de volta! O que você gostaria de fazer hoje?');
             } else {
@@ -187,15 +187,15 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
                                       `Configure sua carteira Liquid para começar\\.`;
                 await ctx.replyWithMarkdownV2(initialMessage, initialConfigKeyboardObj);
                 if (rows.length === 0) {
-                    await dbPool.query('INSERT INTO users (telegram_id, telegram_username) VALUES ($1, $2) ON CONFLICT (telegram_id) DO NOTHING', [telegramUserId, telegramUsername || 'N/A']);
+                    await dbPool.query('INSERT INTO users (telegram_user_id, telegram_id, telegram_username) VALUES ($1, $2, $3) ON CONFLICT (telegram_user_id) DO UPDATE SET telegram_username = EXCLUDED.telegram_username, telegram_id = EXCLUDED.telegram_id', [telegramUserId, telegramUserId, telegramUsername || 'N/A']);
                     logger.info(`User ${telegramUserId} (${telegramUsername}) newly registered in DB (no address yet).`);
-                } else if ((rows[0] && !rows[0].telegram_username && telegramUsername !== 'N/A') || (rows[0]?.telegram_username !== telegramUsername)) { 
-                    await dbPool.query('UPDATE users SET telegram_username = $1, updated_at = NOW() WHERE telegram_id = $2', [telegramUsername, telegramUserId]);
+                } else if ((rows[0] && !rows[0].telegram_username && telegramUsername !== 'N/A') || (rows[0]?.telegram_username !== telegramUsername)) {
+                    await dbPool.query('UPDATE users SET telegram_username = $1, updated_at = NOW() WHERE telegram_user_id = $2', [telegramUsername, telegramUserId]);
                     logger.info(`User ${telegramUserId} username updated to ${telegramUsername}.`);
                 }
             }
-        } catch (error) { 
-            logError('/start', error, ctx); 
+        } catch (error) {
+            logError('/start', error, ctx);
             try { await sendTempError(ctx); } catch (e) { logError('/start fallback reply', e, ctx); }
         }
     });
@@ -221,7 +221,7 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
 
             // Verificar se o usuário pode fazer transações
             const userCheck = await dbPool.query(
-                'SELECT * FROM users WHERE telegram_id = $1',
+                'SELECT * FROM users WHERE telegram_user_id = $1',
                 [telegramUserId]
             );
 
@@ -265,7 +265,7 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
         try {
             const telegramUserId = ctx.from.id;
             const { rows } = await dbPool.query(
-                'SELECT * FROM users WHERE telegram_id = $1',
+                'SELECT * FROM users WHERE telegram_user_id = $1',
                 [telegramUserId]
             );
 
@@ -465,7 +465,7 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
                     await ctx.telegram.editMessageText(ctx.chat.id, messageIdToUpdate, undefined, 'Gerando código QR...');
                                         
                     const userResult = await dbPool.query(
-                        'SELECT liquid_address, payer_name, payer_cpf_cnpj FROM users WHERE telegram_id = $1',
+                        'SELECT liquid_address, payer_name, payer_cpf_cnpj FROM users WHERE telegram_user_id = $1',
                         [telegramUserId]
                     );
                     if (!userResult.rows.length || !userResult.rows[0].liquid_address) {
@@ -810,7 +810,7 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
         clearUserState(ctx.from.id); 
         try {
             await ctx.answerCbQuery();
-            const { rows } = await dbPool.query('SELECT liquid_address FROM users WHERE telegram_id = $1', [ctx.from.id]);
+            const { rows } = await dbPool.query('SELECT liquid_address FROM users WHERE telegram_user_id = $1', [ctx.from.id]);
             if (rows.length > 0 && rows[0].liquid_address) {
                 const message = `**Minha Carteira Liquid Associada**\n\nSeu endereço para receber DePix é:\n\`${escapeMarkdownV2(rows[0].liquid_address)}\`\n\n*Lembre\\-se: Você tem total controle sobre esta carteira\\.*`;
                 const keyboard = Markup.inlineKeyboard([
@@ -1036,7 +1036,7 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
             
             // Verificar se usuário tem endereço Liquid cadastrado
             const userCheck = await dbPool.query(
-                'SELECT liquid_address FROM users WHERE telegram_id = $1',
+                'SELECT liquid_address FROM users WHERE telegram_user_id = $1',
                 [userId]
             );
             
@@ -1526,21 +1526,12 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
                     if (nextLevelData.rows.length > 0) {
                         const nextLevel = nextLevelData.rows[0];
 
-                        // Buscar total de transações confirmadas e volume do usuário
-                        const userStatsQuery = await dbPool.query(
-                            `SELECT
-                                COUNT(*) as transaction_count,
-                                COALESCE(SUM(requested_brl_amount), 0) as total_volume
-                             FROM pix_transactions
-                             WHERE user_id = $1 AND payment_status = 'CONFIRMED'`,
-                            [userId]
-                        );
+                        // Use user's actual stats from the database
+                        // These are now properly updated by the trigger
+                        const currentTxCount = parseInt(userStatus.completed_transactions || 0);
+                        const currentVolume = parseFloat(userStatus.total_volume_brl || 0);
 
-                        const userStats = userStatsQuery.rows[0];
-                        const currentTxCount = parseInt(userStats.transaction_count);
-                        const currentVolume = parseFloat(userStats.total_volume);
-
-                        // Calcular o que falta
+                        // Calcular o que falta para o próximo nível
                         const txNeeded = Math.max(0, nextLevel.min_transactions_for_upgrade - currentTxCount);
                         const volumeNeeded = Math.max(0, nextLevel.min_volume_for_upgrade - currentVolume);
 

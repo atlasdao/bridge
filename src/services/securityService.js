@@ -342,18 +342,20 @@ async function updateDailyUsage(dbPool, userId, amount) {
 async function getUserStatus(dbPool, userId) {
     try {
         const result = await dbPool.query(
-            `SELECT 
+            `SELECT
                 u.*,
                 rlc.description as level_description,
                 rlc.max_per_transaction_brl,
                 (u.daily_limit_brl - u.daily_used_brl) as available_today,
-                CASE 
+                CASE
                     WHEN u.last_limit_reset < CURRENT_DATE THEN 0
-                    ELSE u.daily_used_brl 
-                END as actual_daily_used
+                    ELSE u.daily_used_brl
+                END as actual_daily_used,
+                COALESCE(u.completed_transactions, 0) as completed_transactions,
+                COALESCE(u.total_volume_brl, 0) as total_volume_brl
             FROM users u
             LEFT JOIN reputation_levels_config rlc ON u.reputation_level = rlc.level
-            WHERE u.telegram_id = $1`,
+            WHERE u.telegram_id = $1 OR u.telegram_user_id = $1`,
             [userId]
         );
         

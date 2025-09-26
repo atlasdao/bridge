@@ -49,8 +49,6 @@ const essentialConfigs = {
     'DEPIX_API_BASE_URL': config.depix.apiBaseUrl,
     'DEPIX_API_JWT_TOKEN': config.depix.apiJwtToken,
     'DEPIX_WEBHOOK_SECRET': config.depix.webhookSecret,
-    'SUPABASE_URL': config.supabase.url,
-    'SUPABASE_SERVICE_KEY': config.supabase.serviceKey,
     'DATABASE_URL': config.supabase.databaseUrl,
     'APP_BASE_URL': config.app.baseUrl,
     'REDIS_HOST': config.redis.host,
