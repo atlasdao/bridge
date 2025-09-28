@@ -291,7 +291,7 @@ class ScheduledJobs {
     scheduleUserStateCleanup() {
         // Run every 15 minutes
         const stateCleanupJob = cron.schedule('*/15 * * * *', async () => {
-            logger.debug('[ScheduledJobs] Cleaning up expired user states...');
+            logger.info('[ScheduledJobs] Cleaning up expired user states...');
 
             try {
                 // Clean up database-stored states
