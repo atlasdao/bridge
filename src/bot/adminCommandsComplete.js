@@ -17,7 +17,8 @@ logger.info(`[AdminCommands] Admin IDs configurados: ${ADMIN_IDS.join(', ')}`);
  * Verifica se usuário é admin
  */
 const isAdmin = (userId) => {
-    return ADMIN_IDS.includes(userId);
+    const userIdNum = typeof userId === 'string' ? parseInt(userId) : userId;
+    return ADMIN_IDS.includes(userIdNum);
 };
 
 /**
