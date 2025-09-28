@@ -34,6 +34,7 @@ combined.log
 .cache/
 tmp/
 temp/
+tmp/*
 
 # Módulos de dependências
 # -----------------------
@@ -202,12 +203,19 @@ jest.config.js.backup
 test-results/
 playwright-report/
 coverage/
+tests/
+/tests/
+tmp/tests/
+tmp/*test*
+*test*.js
+*spec*.js
 
 # Documentation gerada
 # ---------------------
 docs/generated/
 api-docs/
 typedoc/
+/docs
 
 # Arquivos específicos do projeto
 # --------------------------------
@@ -217,12 +225,25 @@ init_database.sql
 *.js.backup
 *.backup.*
 src/**/*.backup
+*Fixed.js
+*fixed.js
+*.backup.js
+src/**/*Fixed.js
+src/**/*fixed.js
+src/**/*.backup.js
 
 # Migration files with potential production data
 migrations/*-PRODUCTION.sql
 migrations/*-production-*.sql
 migrations/backup-*.sql
 migrations/prod-*.sql
+migrations/2025-*.sql
+migrations/2024-*.sql
+migrations/fix-*.sql
+migrations/*fix*.sql
+migrations/*critical*.sql
+migrations/*-FINAL.sql
+migrations/*-corrected-*.sql
 
 # Test migration scripts
 migrations/*-test.sql

@@ -6,12 +6,14 @@ const https = require('https');
 const { Pool } = require('pg');
 const IORedis = require('ioredis');
 const { registerBotHandlers } = require('./bot/handlers');
+const { registerAdminCommands } = require('./bot/adminCommandsComplete');
 const { createWebhookRoutes } = require('./routes/webhookRoutes');
 const { initializeExpectationWorker, expectationMessageQueue } = require('./queues/expectationMessageQueue');
 const { initializeExpirationWorker, expirationQueue } = require('./queues/expirationQueue');
 const SecurityMiddleware = require('./middleware/security');
 const SecurityMonitor = require('./services/securityMonitor');
 const depixMonitor = require('./services/depixMonitor');
+const ScheduledJobsService = require('./services/scheduledJobs');
 
 logger.info('--------------------------------------------------');
 logger.info('--- Starting Atlas Bridge Bot ---');
@@ -76,6 +78,18 @@ const bot = new Telegraf(config.telegram.botToken, {
 });
 const getBotInstance = () => bot;
 
+// Initialize maintenance middleware
+const { MaintenanceMiddleware } = require('./middleware/maintenanceCheck');
+const maintenanceMiddleware = new MaintenanceMiddleware(mainRedisConnection, dbPool);
+
+// CRITICAL: Apply maintenance middleware BEFORE any handlers
+// This ensures non-admin users are blocked during maintenance
+bot.use(maintenanceMiddleware.middleware());
+
+// Registrar handlers - admin primeiro para ter prioridade
+registerAdminCommands(bot, dbPool, mainRedisConnection);
+logger.info('[App] Using admin system');
+
 registerBotHandlers(bot, dbPool, expectationMessageQueue, expirationQueue);
 initializeExpectationWorker(dbPool, getBotInstance);
 initializeExpirationWorker(dbPool, getBotInstance);
@@ -83,6 +97,14 @@ initializeExpirationWorker(dbPool, getBotInstance);
 // Iniciar o monitor do DePix
 depixMonitor.setDbPool(dbPool);
 depixMonitor.start();
+
+// Initialize scheduled jobs service
+const scheduledJobs = new ScheduledJobsService(dbPool, mainRedisConnection);
+scheduledJobs.initialize().then(() => {
+    logger.info('[App] Scheduled jobs service initialized successfully');
+}).catch(err => {
+    logger.error('[App] Failed to initialize scheduled jobs:', err);
+});
 
 // Tentativa de conectar ao Telegram com retry e fallback
 const disableTelegram = process.env.DISABLE_TELEGRAM === 'true';
@@ -96,15 +118,33 @@ if (disableTelegram) {
 
     const launchBot = async () => {
         try {
+            logger.info('Attempting to connect to Telegram Bot...');
+
+            // First get bot info to verify connection
+            const botInfo = await bot.telegram.getMe();
+            bot.botInfo = botInfo;
+            logger.info(`Bot verified: @${botInfo.username} (ID: ${botInfo.id})`);
+
+            // Then launch with polling
             await bot.launch({
                 webhook: undefined,
                 dropPendingUpdates: true,
-                allowedUpdates: []
+                allowedUpdates: ['message', 'callback_query', 'inline_query']
             });
+
             logger.info('Telegram Bot started successfully via polling.');
+            logger.info(`Bot username: @${bot.botInfo?.username || 'unknown'}`);
+
         } catch (err) {
             retryCount++;
             logger.error(`Error starting Telegram Bot (attempt ${retryCount}/${maxRetries}):`, err.message);
+
+            // Log more details about the error
+            if (err.response?.error_code === 401) {
+                logger.error('Invalid bot token! Please check TELEGRAM_BOT_TOKEN in .env');
+            } else if (err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT') {
+                logger.error('Network connection issue. Check internet connectivity and Telegram API access.');
+            }
 
             if (retryCount < maxRetries) {
                 logger.info(`Retrying in 5 seconds...`);

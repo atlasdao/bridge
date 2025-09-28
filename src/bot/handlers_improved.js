@@ -401,8 +401,8 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
             if (isValidLiquidAddress(text)) {
                 try {
                     await dbPool.query(
-                        'INSERT INTO users (telegram_id, telegram_username, liquid_address, updated_at) VALUES ($1, $2, $3, NOW()) ON CONFLICT (telegram_id) DO UPDATE SET liquid_address = EXCLUDED.liquid_address, telegram_username = EXCLUDED.telegram_username, updated_at = NOW()',
-                        [telegramUserId, telegramUsername, text]
+                        'INSERT INTO users (telegram_user_id, telegram_id, telegram_username, liquid_address, updated_at) VALUES ($1, $2, $3, $4, NOW()) ON CONFLICT (telegram_user_id) DO UPDATE SET liquid_address = EXCLUDED.liquid_address, telegram_username = EXCLUDED.telegram_username, telegram_id = EXCLUDED.telegram_id, updated_at = NOW()',
+                        [telegramUserId, telegramUserId, telegramUsername, text]
                     );
                     logger.info(`User ${telegramUserId} associated/updated Liquid address: ${text}`);
 

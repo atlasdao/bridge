@@ -553,7 +553,7 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
         } else if (userState && (userState.type === 'liquid_address_initial' || userState.type === 'liquid_address_change')) {
             if (isValidLiquidAddress(text)) {
                 try {
-                    await dbPool.query('INSERT INTO users (telegram_id, telegram_username, liquid_address, updated_at) VALUES ($1, $2, $3, NOW()) ON CONFLICT (telegram_id) DO UPDATE SET liquid_address = EXCLUDED.liquid_address, telegram_username = EXCLUDED.telegram_username, updated_at = NOW()', [telegramUserId, telegramUsername, text]);
+                    await dbPool.query('INSERT INTO users (telegram_user_id, telegram_id, telegram_username, liquid_address, updated_at) VALUES ($1, $2, $3, $4, NOW()) ON CONFLICT (telegram_user_id) DO UPDATE SET liquid_address = EXCLUDED.liquid_address, telegram_username = EXCLUDED.telegram_username, telegram_id = EXCLUDED.telegram_id, updated_at = NOW()', [telegramUserId, telegramUserId, telegramUsername, text]);
                     logger.info(`User ${telegramUserId} associated/updated Liquid address: ${text}`);
                     const successMessage = 'Endereço Liquid associado com sucesso!';
                     let successMsg;
@@ -580,9 +580,9 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
                 await ctx.replyWithMarkdownV2(`O endereço fornecido não parece ser uma carteira Liquid válida\\. Verifique o formato e tente novamente\\.`, Markup.inlineKeyboard([[Markup.button.callback('❌ Preciso de Ajuda com Carteira', 'explain_liquid_wallet')]]));
             }
         } else {
-            // Validação falhou para valor monetário
+            // Estado desconhecido ou não tratado
             clearUserState(telegramUserId);
-            await ctx.reply(`❌ ${validation.error || 'Valor inválido. Por favor, digite um valor entre R$ 1,00 e R$ ' + maxAllowed.toFixed(2)}`);
+            await ctx.reply('❌ Comando não reconhecido. Por favor, use /start para começar.');
         }
     });
 
@@ -1606,10 +1606,10 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
         }
     });
 
-    bot.catch((err, ctx) => { 
+    bot.catch((err, ctx) => {
         logError('Global Telegraf bot.catch', err, ctx);
-        if (err.message?.includes("query is too old") || err.message?.includes("message is not modified")) return; 
-        try { ctx.reply('Desculpe, ocorreu um erro inesperado. Por favor, tente /start novamente.'); } 
+        if (err.message?.includes("query is too old") || err.message?.includes("message is not modified")) return;
+        try { ctx.reply('Desculpe, ocorreu um erro inesperado. Por favor, tente /start novamente.'); }
         catch (replyError) { logError('Global bot.catch sendMessage fallback', replyError, ctx); }
     });
     

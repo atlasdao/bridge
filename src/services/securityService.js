@@ -308,10 +308,10 @@ async function processVerificationPayment(dbPool, depixApiEntryId, payerName, pa
 async function updateDailyUsage(dbPool, userId, amount) {
     try {
         await dbPool.query(
-            `UPDATE users 
+            `UPDATE users
             SET daily_used_brl = daily_used_brl + $1,
                 updated_at = NOW()
-            WHERE telegram_id = $2`,
+            WHERE telegram_user_id = $2`,
             [amount, userId]
         );
         
