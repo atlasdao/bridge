@@ -161,23 +161,10 @@ const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expira
             ]
         );
 
-        // If payment confirmed, update user stats atomically within the same transaction
+        // If payment confirmed, check for reputation upgrade
+        // NOTE: User stats (daily_used_brl, total_volume_brl, completed_transactions) are updated
+        // by the database trigger process_transaction_status() to avoid double-counting
         if (newPaymentStatus === 'CONFIRMED') {
-            // Update daily usage
-            await client.query(
-                `UPDATE users
-                SET daily_used_brl = daily_used_brl + $1,
-                    updated_at = NOW()
-                WHERE telegram_user_id = $2`,
-                [requestedAmountBRL, recipientTelegramUserId]
-            );
-
-            // Recalculate user stats
-            await client.query(
-                'SELECT recalculate_user_stats($1)',
-                [recipientTelegramUserId]
-            );
-
             // Check for reputation upgrade
             const upgradeResult = await client.query(
                 'SELECT * FROM check_reputation_upgrade($1)',
@@ -217,14 +204,29 @@ const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expira
         // Rollback transaction on any error
         await client.query('ROLLBACK');
 
-        // Log the error
-        await client.query(
-            `INSERT INTO transaction_processing_log (transaction_id, processing_stage, status, error_message)
-            VALUES ($1, $2, $3, $4)`,
-            [qrId, 'webhook_error', 'FAILED', error.message]
-        );
+        // Enhanced error logging
+        const errorDetails = {
+            qrId,
+            status,
+            error: error.message,
+            stack: error.stack,
+            payerCpfCnpj,
+            payerName,
+            timestamp: new Date().toISOString()
+        };
 
-        logger.error(`[Process] Error processing webhook for qrId ${qrId}:`, error);
+        // Log the error
+        try {
+            await client.query(
+                `INSERT INTO transaction_processing_log (transaction_id, processing_stage, status, error_message, payload)
+                VALUES ($1, $2, $3, $4, $5)`,
+                [qrId, 'webhook_error', 'FAILED', error.message, JSON.stringify(errorDetails)]
+            );
+        } catch (logError) {
+            logger.error(`[Process] Failed to log error to database:`, logError);
+        }
+
+        logger.error(`[Process] Error processing webhook for qrId ${qrId}:`, errorDetails);
         throw error;
 
     } finally {
