@@ -240,6 +240,8 @@ const processVerificationWebhook = async (verification, webhookData, dbPool, bot
     const { verification_id, telegram_user_id, verification_status } = verification;
     const { status, payer } = webhookData;
 
+    logger.info(`[ProcessVerification] Processing verification ${verification_id} with status ${status}, payer data: ${JSON.stringify(payer)}`);
+
     if (verification_status !== 'PENDING') {
         logger.info(`[Process] Verification ${verification_id} already processed.`);
         return { success: true, message: 'Verification already processed.' };
@@ -250,28 +252,36 @@ const processVerificationWebhook = async (verification, webhookData, dbPool, bot
     try {
         await client.query('BEGIN');
 
-        if (status === 'depix_sent' && payer?.cpfCnpj) {
+        // Accept depix_sent even without payer data for verification
+        if (status === 'depix_sent') {
+            // Get payer info if available
+            const payerCpf = payer?.cpfCnpj || null;
+            const payerName = payer?.name || null;
+
             // Update user as verified
             await client.query(
                 `UPDATE users
                 SET is_verified = true,
-                    payer_cpf_cnpj = $1,
-                    payer_name = $2,
+                    payer_cpf_cnpj = COALESCE($1, payer_cpf_cnpj),
+                    payer_name = COALESCE($2, payer_name),
                     verification_date = NOW(),
+                    reputation_level = CASE WHEN reputation_level = 0 THEN 1 ELSE reputation_level END,
+                    daily_limit_brl = CASE WHEN reputation_level = 0 THEN 50 ELSE daily_limit_brl END,
                     updated_at = NOW()
                 WHERE telegram_user_id = $3`,
-                [payer.cpfCnpj, payer.name || null, telegram_user_id]
+                [payerCpf, payerName, telegram_user_id]
             );
 
             // Update verification transaction
             await client.query(
                 `UPDATE verification_transactions
                 SET verification_status = 'COMPLETED',
-                    payer_cpf_cnpj = $1,
-                    payer_name = $2,
+                    payer_cpf_cnpj = COALESCE($1, payer_cpf_cnpj),
+                    payer_name = COALESCE($2, payer_name),
+                    verified_at = NOW(),
                     updated_at = NOW()
                 WHERE verification_id = $3`,
-                [payer.cpfCnpj, payer.name || null, verification_id]
+                [payerCpf, payerName, verification_id]
             );
 
             await client.query('COMMIT');
