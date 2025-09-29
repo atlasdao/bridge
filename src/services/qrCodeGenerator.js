@@ -19,7 +19,7 @@ async function generateCustomQRCode(pixCode, amount) {
             width: 300, // Otimizado
             margin: 2,
             color: {
-                dark: '#000000',  // QR code preto
+                dark: '#000000ff',  // QR code preto
                 light: '#FFFFFF'  // Fundo brancoo 
             }
         };

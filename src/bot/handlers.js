@@ -21,6 +21,36 @@ const isValidLiquidAddress = (address) => {
     return true;
 };
 
+const validateMonetaryAmount = (value, options = {}) => {
+    const { minValue = 0, maxValue = Number.MAX_VALUE, maxDecimals = 2 } = options;
+
+    // Remove any currency symbols and spaces
+    const cleanValue = String(value).replace(/[R$\s]/g, '').replace(',', '.');
+
+    // Check if it's a valid number
+    const numValue = parseFloat(cleanValue);
+    if (isNaN(numValue)) {
+        return { valid: false, error: 'Valor inválido. Use apenas números.' };
+    }
+
+    // Check decimal places
+    const decimalPart = cleanValue.split('.')[1];
+    if (decimalPart && decimalPart.length > maxDecimals) {
+        return { valid: false, error: `Máximo de ${maxDecimals} casas decimais permitidas.` };
+    }
+
+    // Check range
+    if (numValue < minValue) {
+        return { valid: false, error: `Valor mínimo é R$ ${minValue.toFixed(2)}` };
+    }
+
+    if (numValue > maxValue) {
+        return { valid: false, error: `Valor máximo é R$ ${maxValue.toFixed(2)}` };
+    }
+
+    return { valid: true, value: numValue };
+};
+
 let awaitingInputForUser = {}; 
 
 const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQueue) => {
@@ -173,9 +203,13 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
         }
 
         // Verificar se tem username
-        const usernameCheck = UserValidation.checkUsername(ctx);
-        if (!usernameCheck.valid) {
-            await ctx.reply(usernameCheck.error);
+        if (!telegramUsername) {
+            await ctx.reply('❌ Você precisa ter um username no Telegram para usar este bot.\n\n' +
+                           'Para adicionar um username:\n' +
+                           '1. Vá em Configurações\n' +
+                           '2. Toque em "Nome de usuário"\n' +
+                           '3. Escolha um nome único\n' +
+                           '4. Depois volte e digite /start novamente');
             return;
         }
 
@@ -409,7 +443,8 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
                 userStatusCheck?.max_per_transaction_brl || 5000
             );
 
-            const validation = InputValidator.validateMonetaryAmount(text, {
+            // Validate monetary amount
+            const validation = validateMonetaryAmount(text, {
                 minValue: 1,
                 maxValue: maxAllowed,
                 maxDecimals: 2
@@ -630,14 +665,17 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
             const userId = ctx.from.id;
 
             // Verificar username antes de prosseguir
-            const usernameCheck = UserValidation.checkUsername(ctx);
-            if (!usernameCheck.valid) {
-                await ctx.editMessageText(usernameCheck.error);
+            const username = ctx.from.username;
+            if (!username) {
+                await ctx.editMessageText('❌ Você precisa ter um username no Telegram para usar este bot.');
                 return;
             }
 
             // Atualizar username se mudou
-            await UserValidation.updateUsernameIfChanged(dbPool, userId, usernameCheck.username);
+            await dbPool.query(
+                'UPDATE users SET telegram_username = $1, updated_at = NOW() WHERE telegram_user_id = $2 AND telegram_username != $1',
+                [username, userId]
+            );
             
             // Verificar status completo do usuário
             const userStatus = await securityService.getUserStatus(dbPool, userId);
