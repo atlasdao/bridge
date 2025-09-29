@@ -26,8 +26,6 @@ const config = {
         port: parseInt(process.env.PORT, 10) || (nodeEnv === 'production' ? 3000 : 3001),
         nodeEnv: nodeEnv,
     },
-    // URL interna do ambiente de desenvolvimento para o forwarder.
-    developmentServerUrl: 'http://localhost:3001',
     tor: {
         socksProxy: process.env.TOR_SOCKS_PROXY,
     },

@@ -281,6 +281,7 @@ const registerAdminCommands = (bot, dbPool, redisClient) => {
                 [Markup.button.callback('🔄 Limpar Cache', 'sys_cache')],
                 [Markup.button.callback('📈 Métricas', 'sys_metrics')],
                 [Markup.button.callback('📜 Logs', 'sys_logs')],
+                [Markup.button.callback('💬 Msg Pós-Compra', 'sys_post_purchase')],
                 [Markup.button.callback('🛡️ Segurança', 'sys_security')],
                 [Markup.button.callback('🔧 Manutenção', 'sys_maintenance')],
                 [Markup.button.callback('💾 Backups', 'sys_backup')],
@@ -590,6 +591,10 @@ const registerAdminCommands = (bot, dbPool, redisClient) => {
                     await handleUserBanReason(ctx, state);
                     break;
 
+                case 'edit_post_purchase_message':
+                    await handlePostPurchaseMessage(ctx, state);
+                    break;
+
                 default:
                     return next();
             }
@@ -636,6 +641,49 @@ const registerAdminCommands = (bot, dbPool, redisClient) => {
             await ctx.reply(message, {
                 reply_markup: Markup.inlineKeyboard(buttons).reply_markup
             });
+        }
+
+        activeStates.delete(ctx.from.id);
+    }
+
+    // Handler para editar mensagem pós-compra
+    async function handlePostPurchaseMessage(ctx, state) {
+        const newMessage = ctx.message.text.trim();
+
+        if (newMessage.length > 1000) {
+            await ctx.reply('❌ Mensagem muito longa! Máximo de 1000 caracteres.');
+            return;
+        }
+
+        try {
+            await dbPool.query(
+                "UPDATE system_config SET value = $1, updated_at = NOW() WHERE key = 'post_purchase_message'",
+                [newMessage]
+            );
+
+            await auditService.logAdminAction({
+                adminId: ctx.from.id,
+                adminUsername: ctx.from.username,
+                actionType: 'POST_PURCHASE_UPDATE',
+                actionDescription: 'Mensagem pós-compra atualizada',
+                targetUserId: null,
+                metadata: { newMessage }
+            });
+
+            await ctx.reply(
+                `✅ *Mensagem Pós-Compra Atualizada!*\n\n` +
+                `A nova mensagem será enviada após compras bem-sucedidas.\n\n` +
+                `📝 *Nova mensagem:*\n\`\`\`\n${newMessage}\n\`\`\``,
+                {
+                    parse_mode: 'Markdown',
+                    reply_markup: Markup.inlineKeyboard([
+                        [Markup.button.callback('◀️ Voltar ao Menu', 'sys_post_purchase')]
+                    ]).reply_markup
+                }
+            );
+        } catch (error) {
+            logger.error(`[Update Post Purchase] Erro: ${error.message}`);
+            await ctx.reply('❌ Erro ao atualizar mensagem pós-compra.');
         }
 
         activeStates.delete(ctx.from.id);
@@ -1884,6 +1932,116 @@ const registerAdminCommands = (bot, dbPool, redisClient) => {
         } catch (error) {
             logger.error(`[System Logs] Erro: ${error.message}`);
             await ctx.answerCbQuery('❌ Erro ao carregar logs');
+        }
+    });
+
+    // Handler para Post-Purchase Message
+    bot.action('sys_post_purchase', requireAdmin, async (ctx) => {
+        try {
+            // Get current message from database
+            const { rows } = await dbPool.query(
+                "SELECT value FROM system_config WHERE key = 'post_purchase_message' AND active = true"
+            );
+
+            const currentMessage = rows.length > 0 ? rows[0].value : 'Não configurado';
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('✏️ Editar Mensagem', 'edit_post_purchase')],
+                [Markup.button.callback('👁️ Visualizar', 'preview_post_purchase')],
+                [Markup.button.callback('🔄 Restaurar Padrão', 'reset_post_purchase')],
+                [Markup.button.callback('◀️ Voltar', 'adm_system')]
+            ]);
+
+            await ctx.editMessageText(
+                `💬 *Mensagem Pós-Compra*\n\n` +
+                `Esta mensagem é enviada automaticamente 3 segundos após uma compra bem-sucedida.\n\n` +
+                `📝 *Mensagem Atual:*\n\`\`\`\n${currentMessage.substring(0, 500)}${currentMessage.length > 500 ? '...' : ''}\n\`\`\`\n\n` +
+                `Use os botões abaixo para gerenciar a mensagem.`,
+                {
+                    parse_mode: 'Markdown',
+                    reply_markup: keyboard.reply_markup
+                }
+            );
+            await ctx.answerCbQuery();
+        } catch (error) {
+            logger.error(`[Post Purchase Message] Erro: ${error.message}`);
+            await ctx.answerCbQuery('❌ Erro ao carregar configuração');
+        }
+    });
+
+    // Handler para editar post-purchase message
+    bot.action('edit_post_purchase', requireAdmin, async (ctx) => {
+        activeStates.set(ctx.from.id, {
+            action: 'edit_post_purchase_message'
+        });
+
+        await ctx.editMessageText(
+            `✏️ *Editar Mensagem Pós-Compra*\n\n` +
+            `Digite a nova mensagem que será enviada após compras bem-sucedidas.\n\n` +
+            `💡 *Dicas:*\n` +
+            `• Use \\* para negrito\n` +
+            `• Use \\n para quebras de linha\n` +
+            `• Máximo de 1000 caracteres\n\n` +
+            `Digite /cancel para cancelar`,
+            { parse_mode: 'Markdown' }
+        );
+        await ctx.answerCbQuery('Aguardando nova mensagem...');
+    });
+
+    // Handler para preview da mensagem
+    bot.action('preview_post_purchase', requireAdmin, async (ctx) => {
+        try {
+            const { rows } = await dbPool.query(
+                "SELECT value FROM system_config WHERE key = 'post_purchase_message' AND active = true"
+            );
+
+            const message = rows.length > 0 ? rows[0].value : 'Não configurado';
+
+            // Show the message exactly as it will appear (without markdown parsing issues)
+            await ctx.reply(
+                `👁️ Preview da Mensagem Pós-Compra:\n\n${message}`,
+                {
+                    reply_markup: Markup.inlineKeyboard([
+                        [Markup.button.callback('◀️ Voltar', 'sys_post_purchase')]
+                    ]).reply_markup
+                }
+            );
+            await ctx.answerCbQuery();
+        } catch (error) {
+            logger.error(`[Preview Post Purchase] Erro: ${error.message}`);
+            await ctx.answerCbQuery('❌ Erro ao visualizar mensagem');
+        }
+    });
+
+    // Handler para resetar mensagem padrão
+    bot.action('reset_post_purchase', requireAdmin, async (ctx) => {
+        try {
+            const defaultMessage = '🎯 *Sucesso na sua compra!*\n\n' +
+                'Aproveite seus DePix! Lembre-se:\n' +
+                '• DePix é um Real digital soberano\n' +
+                '• Você tem controle total dos seus fundos\n' +
+                '• Transações rápidas e privadas na Liquid Network\n\n' +
+                'Precisa de ajuda? @atlasDAO_support';
+
+            await dbPool.query(
+                "UPDATE system_config SET value = $1, updated_at = NOW() WHERE key = 'post_purchase_message'",
+                [defaultMessage]
+            );
+
+            await auditService.logAdminAction({
+                adminId: ctx.from.id,
+                adminUsername: ctx.from.username,
+                actionType: 'POST_PURCHASE_RESET',
+                actionDescription: 'Mensagem pós-compra restaurada ao padrão'
+            });
+
+            await ctx.answerCbQuery('✅ Mensagem restaurada ao padrão');
+
+            // Reload the menu
+            bot.action('sys_post_purchase').trigger(ctx);
+        } catch (error) {
+            logger.error(`[Reset Post Purchase] Erro: ${error.message}`);
+            await ctx.answerCbQuery('❌ Erro ao resetar mensagem');
         }
     });
 

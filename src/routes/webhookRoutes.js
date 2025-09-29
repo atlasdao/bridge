@@ -3,9 +3,9 @@ const config = require('../core/config');
 const logger = require('../core/logger');
 const { escapeMarkdownV2 } = require('../utils/escapeMarkdown');
 const safeCompare = require('safe-compare');
-const axios = require('axios');
 const { Markup } = require('telegraf');
 const securityService = require('../services/securityService');
+const uxService = require('../services/userExperienceService');
 
 /**
  * Process webhook with proper transaction isolation and idempotency
@@ -161,10 +161,23 @@ const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expira
             ]
         );
 
-        // If payment confirmed, check for reputation upgrade
+        // If payment confirmed, check for reputation upgrade and update streak
         // NOTE: User stats (daily_used_brl, total_volume_brl, completed_transactions) are updated
         // by the database trigger process_transaction_status() to avoid double-counting
         if (newPaymentStatus === 'CONFIRMED') {
+            // Update daily streak
+            const newStreak = await uxService.updateDailyStreak(client, recipientTelegramUserId);
+
+            // Award XP based on transaction amount
+            let xpReason = 'transaction_small';
+            if (requestedAmountBRL >= 200) {
+                xpReason = 'transaction_large';
+            } else if (requestedAmountBRL >= 50) {
+                xpReason = 'transaction_medium';
+            }
+
+            const xpResult = await uxService.awardXP(client, recipientTelegramUserId, requestedAmountBRL, xpReason);
+
             // Check for reputation upgrade
             const upgradeResult = await client.query(
                 'SELECT * FROM check_reputation_upgrade($1)',
@@ -177,6 +190,10 @@ const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expira
                 VALUES ($1, $2, $3)`,
                 [ourTransactionId, 'webhook_processed', newPaymentStatus]
             );
+
+            // Store streak and XP info for notifications
+            webhookData.newStreak = newStreak;
+            webhookData.xpResult = xpResult;
         }
 
         // Commit the transaction - all operations succeed or all fail
@@ -195,7 +212,10 @@ const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expira
             refundReason,
             userInfo,
             qrMessageId,
-            reminderMessageId
+            reminderMessageId,
+            webhookData.newStreak,
+            webhookData.xpResult,
+            client
         );
 
         return { success: true, message: 'Webhook processed successfully.' };
@@ -353,7 +373,10 @@ const sendNotifications = async (
     refundReason,
     userInfo,
     qrMessageId,
-    reminderMessageId
+    reminderMessageId,
+    newStreak,
+    xpResult,
+    dbClient
 ) => {
     if (!bot || !recipientTelegramUserId) {
         logger.error(`[Process] Cannot send notification: bot or userId missing.`);
@@ -382,12 +405,29 @@ const sendNotifications = async (
     // Prepare user message
     let userMessage;
     if (newPaymentStatus === 'CONFIRMED') {
-        userMessage = `✅ **Transação Concluída\\!**\n\n` +
+        // Get smart success message based on user achievements
+        const successMessage = await uxService.getSuccessMessage(dbClient, recipientTelegramUserId, requestedAmountBRL);
+
+        userMessage = `${escapeMarkdownV2(successMessage)}\n\n` +
             `💰 Valor: R\\$ ${escapeMarkdownV2(Number(requestedAmountBRL).toFixed(2))}\n`;
-        if (blockchainTxID) {
-            userMessage += `🔗 Liquid TX: \`${escapeMarkdownV2(blockchainTxID)}\`\n\n`;
+
+        // Add XP and streak info if available
+        if (xpResult && xpResult.xpAwarded) {
+            userMessage += `⭐ \\+${xpResult.xpAwarded} XP ganhos\\!\n`;
+            if (xpResult.leveledUp) {
+                userMessage += `🎉 **Você subiu para o nível ${xpResult.newLevel}\\!**\n`;
+            }
         }
-        userMessage += `Obrigado por usar o Atlas Bridge\\!`;
+
+        if (newStreak && newStreak > 1) {
+            userMessage += `🔥 Sequência: ${newStreak} dias\\!\n`;
+        }
+
+        if (blockchainTxID) {
+            userMessage += `\n🔗 Liquid TX: \`${escapeMarkdownV2(blockchainTxID)}\`\n`;
+        }
+
+        userMessage += `\nObrigado por usar o Atlas Bridge\\!`;
 
         // Send with menu
         const mainMenuKeyboard = Markup.inlineKeyboard([
@@ -402,6 +442,45 @@ const sendNotifications = async (
             parse_mode: 'MarkdownV2',
             reply_markup: mainMenuKeyboard.reply_markup
         });
+
+        // Send post-purchase message after successful transaction
+        setTimeout(async () => {
+            try {
+                // Get post-purchase message from config
+                const { rows } = await dbClient.query(
+                    "SELECT value FROM system_config WHERE key = 'post_purchase_message' AND active = true"
+                );
+
+                if (rows.length > 0 && rows[0].value) {
+                    // Format message with markdown support
+                    const postPurchaseMessage = rows[0].value
+                        .replace(/\*/g, '\\*')
+                        .replace(/_/g, '\\_')
+                        .replace(/\[/g, '\\[')
+                        .replace(/\]/g, '\\]')
+                        .replace(/\(/g, '\\(')
+                        .replace(/\)/g, '\\)')
+                        .replace(/~/g, '\\~')
+                        .replace(/`/g, '\\`')
+                        .replace(/>/g, '\\>')
+                        .replace(/#/g, '\\#')
+                        .replace(/\+/g, '\\+')
+                        .replace(/-/g, '\\-')
+                        .replace(/=/g, '\\=')
+                        .replace(/\|/g, '\\|')
+                        .replace(/\{/g, '\\{')
+                        .replace(/\}/g, '\\}')
+                        .replace(/\./g, '\\.')
+                        .replace(/!/g, '\\!');
+
+                    await bot.telegram.sendMessage(recipientTelegramUserId, postPurchaseMessage, {
+                        parse_mode: 'MarkdownV2'
+                    });
+                }
+            } catch (error) {
+                logger.error(`[Process] Error sending post-purchase message:`, error);
+            }
+        }, 3000); // Send after 3 seconds
 
     } else if (newPaymentStatus === 'REFUNDED') {
         userMessage = `⚠️ **Pagamento será reembolsado**\n\n` +
@@ -430,7 +509,7 @@ const sendNotifications = async (
 /**
  * Create webhook routes with proper error handling
  */
-const createWebhookRoutes = (bot, dbPool, devDbPool, expectationQueue, expirationQueue) => {
+const createWebhookRoutes = (bot, dbPool, expectationQueue, expirationQueue) => {
     const router = express.Router();
 
     router.post('/depix_payment', async (req, res) => {
@@ -461,20 +540,8 @@ const createWebhookRoutes = (bot, dbPool, devDbPool, expectationQueue, expiratio
             // Process in background
             setImmediate(async () => {
                 try {
-                    // Check if this webhook belongs to this environment
-                    if (config.app.nodeEnv === 'production') {
-                        const shouldProcess = await checkWebhookOwnership(qrId, dbPool, devDbPool);
-
-                        if (shouldProcess === 'production') {
-                            await processWebhook(webhookData, dbPool, bot, expectationQueue, expirationQueue);
-                        } else if (shouldProcess === 'development' && devDbPool) {
-                            // Forward to development
-                            await forwardWebhook(webhookData, req.headers.authorization);
-                        }
-                    } else {
-                        // Development environment - just process
-                        await processWebhook(webhookData, dbPool, bot, expectationQueue, expirationQueue);
-                    }
+                    // Process webhook directly
+                    await processWebhook(webhookData, dbPool, bot, expectationQueue, expirationQueue);
                 } catch (bgError) {
                     logger.error('[Router] Background processing error:', bgError);
                 }
@@ -493,62 +560,5 @@ const createWebhookRoutes = (bot, dbPool, devDbPool, expectationQueue, expiratio
     return router;
 };
 
-/**
- * Check which environment owns this webhook
- */
-const checkWebhookOwnership = async (qrId, dbPool, devDbPool) => {
-    // Check production database
-    const { rows: pixRows } = await dbPool.query(
-        'SELECT 1 FROM pix_transactions WHERE depix_api_entry_id = $1',
-        [qrId]
-    );
-
-    const { rows: verificationRows } = await dbPool.query(
-        'SELECT 1 FROM verification_transactions WHERE depix_api_entry_id = $1',
-        [qrId]
-    );
-
-    if (pixRows.length > 0 || verificationRows.length > 0) {
-        return 'production';
-    }
-
-    // Check development database if configured
-    if (devDbPool) {
-        const { rows: devPixRows } = await devDbPool.query(
-            'SELECT 1 FROM pix_transactions WHERE depix_api_entry_id = $1',
-            [qrId]
-        );
-
-        const { rows: devVerificationRows } = await devDbPool.query(
-            'SELECT 1 FROM verification_transactions WHERE depix_api_entry_id = $1',
-            [qrId]
-        );
-
-        if (devPixRows.length > 0 || devVerificationRows.length > 0) {
-            return 'development';
-        }
-    }
-
-    return null;
-};
-
-/**
- * Forward webhook to development server
- */
-const forwardWebhook = async (webhookData, authorization) => {
-    try {
-        await axios.post(
-            `${config.developmentServerUrl}/webhooks/depix_payment`,
-            webhookData,
-            {
-                headers: { 'Authorization': authorization },
-                timeout: 10000
-            }
-        );
-        logger.info(`[Router] Webhook forwarded successfully.`);
-    } catch (error) {
-        logger.error(`[Router] Failed to forward webhook:`, error.message);
-    }
-};
 
 module.exports = { processWebhook, createWebhookRoutes };

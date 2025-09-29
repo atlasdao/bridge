@@ -20,17 +20,6 @@ logger.info('--- Starting Atlas Bridge Bot ---');
 logger.info(`--- Environment: ${config.app.nodeEnv} ---`);
 logger.info('--------------------------------------------------');
 
-let devDbPool = null;
-if (config.app.nodeEnv === 'production') {
-    const devDatabaseUrl = process.env.DEV_DATABASE_URL;
-    if (devDatabaseUrl) {
-        devDbPool = new Pool({ connectionString: devDatabaseUrl });
-        logger.info('Production environment has access to the Development Database for webhook forwarding.');
-    } else {
-        logger.warn('DEV_DATABASE_URL not set in .env.production. Webhook forwarding to dev environment will be disabled.');
-    }
-}
-
 const dbPool = new Pool({
     connectionString: config.supabase.databaseUrl,
 });
@@ -188,7 +177,7 @@ securityMonitor.on('highRiskDetected', (data) => {
 
 app.get('/', (req, res) => res.status(200).send(`Atlas Bridge Bot App is alive! [ENV: ${config.app.nodeEnv}]`));
 // Rate limiter específico para webhooks
-app.use('/webhooks', rateLimiters.webhook, createWebhookRoutes(bot, dbPool, devDbPool, expectationMessageQueue, expirationQueue));
+app.use('/webhooks', rateLimiters.webhook, createWebhookRoutes(bot, dbPool, expectationMessageQueue, expirationQueue));
 
 // CORREÇÃO: Especificar o host '0.0.0.0' para garantir que o servidor
 // escute em todas as interfaces de rede, incluindo localhost.
@@ -225,7 +214,6 @@ const gracefulShutdown = async (signal) => {
         try {
             await dbPool.end();
             logger.info('Primary Database pool closed.');
-            if (devDbPool) await devDbPool.end();
         } catch (err) {
             logger.error('Error closing database pool:', err.message);
         }
