@@ -7,19 +7,8 @@ const { escapeMarkdownV2 } = require('../utils/escapeMarkdown');
 const securityService = require('../services/securityService');
 const { generateCustomQRCode } = require('../services/qrCodeGenerator');
 const uxService = require('../services/userExperienceService');
-
-const isValidLiquidAddress = (address) => {
-    // Basic Liquid address validation
-    if (!address || typeof address !== 'string') {
-        logger.info(`[isValidLiquidAddress] Invalid: not a string`);
-        return false;
-    }
-    if (address.length < 34 || address.length > 74) {
-        logger.info(`[isValidLiquidAddress] Invalid: wrong length`);
-        return false;
-    }
-    return true;
-};
+const UserValidation = require('../utils/userValidation');
+const InputValidator = require('../utils/inputValidator');
 
 const validateMonetaryAmount = (value, options = {}) => {
     const { minValue = 0, maxValue = Number.MAX_VALUE, maxDecimals = 2 } = options;
@@ -622,7 +611,8 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
                 await ctx.replyWithMarkdownV2(`Valor inválido\\. Por favor, envie um valor entre R\\$ 1\\.00 e R\\$ ${escapeMarkdownV2(maxAllowed.toFixed(2))} \\(ex: \`45.21\`\\)\\.`);
             }
         } else if (userState && (userState.type === 'liquid_address_initial' || userState.type === 'liquid_address_change')) {
-            if (isValidLiquidAddress(text)) {
+            const validation = InputValidator.validateLiquidAddress(text);
+            if (validation.valid) {
                 try {
                     await dbPool.query('INSERT INTO users (telegram_user_id, telegram_id, telegram_username, liquid_address, updated_at) VALUES ($1, $2, $3, $4, NOW()) ON CONFLICT (telegram_user_id) DO UPDATE SET liquid_address = EXCLUDED.liquid_address, telegram_username = EXCLUDED.telegram_username, telegram_id = EXCLUDED.telegram_id, updated_at = NOW()', [telegramUserId, telegramUserId, telegramUsername, text]);
                     logger.info(`User ${telegramUserId} associated/updated Liquid address: ${text}`);
