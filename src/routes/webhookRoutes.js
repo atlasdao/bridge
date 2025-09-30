@@ -286,7 +286,8 @@ const processVerificationWebhook = async (verification, webhookData, dbPool, bot
                 SET is_verified = true,
                     payer_cpf_cnpj = COALESCE($1, payer_cpf_cnpj),
                     payer_name = COALESCE($2, payer_name),
-                    verification_date = NOW(),
+                    verification_payment_date = NOW(),
+                    verified_at = NOW(),
                     reputation_level = CASE WHEN reputation_level = 0 THEN 1 ELSE reputation_level END,
                     daily_limit_brl = CASE WHEN reputation_level = 0 THEN 50 ELSE daily_limit_brl END,
                     updated_at = NOW()

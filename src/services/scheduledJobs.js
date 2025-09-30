@@ -26,6 +26,9 @@ class ScheduledJobs {
         // Schedule user state cleanup (for memory leak prevention)
         this.scheduleUserStateCleanup();
 
+        // Schedule verification polling (webhook fallback)
+        this.scheduleVerificationPolling();
+
         logger.info('[ScheduledJobs] All jobs initialized');
     }
 
@@ -323,6 +326,160 @@ class ScheduledJobs {
 
         this.jobs.set('user_state_cleanup', stateCleanupJob);
         logger.info('[ScheduledJobs] User state cleanup scheduled every 15 minutes');
+    }
+
+    /**
+     * Schedule polling of pending verification transactions (webhook fallback)
+     * This ensures verifications are completed even if webhooks fail
+     */
+    scheduleVerificationPolling() {
+        const depixApiService = require('./depixApiService');
+        const { processWebhook } = require('../routes/webhookRoutes');
+
+        // Run every 5 minutes
+        const pollingJob = cron.schedule('*/5 * * * *', async () => {
+            try {
+                // Find PENDING verifications that are >2 minutes old (give webhooks time to arrive)
+                const pendingVerifications = await this.dbPool.query(`
+                    SELECT
+                        vt.verification_id,
+                        vt.telegram_user_id,
+                        vt.depix_api_entry_id,
+                        vt.verification_status,
+                        vt.created_at
+                    FROM verification_transactions vt
+                    WHERE vt.verification_status = 'PENDING'
+                        AND vt.created_at < NOW() - INTERVAL '2 minutes'
+                        AND vt.created_at > NOW() - INTERVAL '12 hours'
+                    ORDER BY vt.created_at ASC
+                    LIMIT 50
+                `);
+
+                if (pendingVerifications.rowCount === 0) {
+                    return;
+                }
+
+                logger.info(`[ScheduledJobs] Polling ${pendingVerifications.rowCount} pending verifications`);
+
+                let completed = 0;
+                let failed = 0;
+                let pending = 0;
+
+                for (const verification of pendingVerifications.rows) {
+                    try {
+                        // Query Depix API for status
+                        const depixStatus = await depixApiService.getDepositStatus(verification.depix_api_entry_id);
+
+                        if (depixStatus.status === 'depix_sent') {
+                            // Payment completed! Process as webhook
+                            logger.info(`[ScheduledJobs] Found completed verification for user ${verification.telegram_user_id} via polling`);
+
+                            const client = await this.dbPool.connect();
+                            try {
+                                await client.query('BEGIN');
+
+                                const payerName = depixStatus.payer?.name || null;
+                                const payerCpfCnpj = depixStatus.payer?.cpfCnpj || null;
+
+                                // Update verification transaction
+                                await client.query(
+                                    `UPDATE verification_transactions
+                                    SET verification_status = 'COMPLETED',
+                                        payer_name = $1,
+                                        payer_cpf_cnpj = $2,
+                                        verified_at = NOW(),
+                                        updated_at = NOW()
+                                    WHERE verification_id = $3`,
+                                    [payerName, payerCpfCnpj, verification.verification_id]
+                                );
+
+                                // Update user as verified
+                                await client.query(
+                                    `UPDATE users
+                                    SET is_verified = true,
+                                        payer_cpf_cnpj = COALESCE($1, payer_cpf_cnpj),
+                                        payer_name = COALESCE($2, payer_name),
+                                        reputation_level = CASE WHEN reputation_level = 0 THEN 1 ELSE reputation_level END,
+                                        daily_limit_brl = CASE WHEN reputation_level = 0 THEN 50 ELSE daily_limit_brl END,
+                                        updated_at = NOW()
+                                    WHERE telegram_user_id = $3 AND is_verified = false`,
+                                    [payerCpfCnpj, payerName, verification.telegram_user_id]
+                                );
+
+                                await client.query('COMMIT');
+                                completed++;
+
+                                logger.info(`[ScheduledJobs] Successfully completed verification ${verification.verification_id} via polling`);
+
+                            } catch (error) {
+                                await client.query('ROLLBACK');
+                                logger.error(`[ScheduledJobs] Error processing polled verification: ${error.message}`);
+                                failed++;
+                            } finally {
+                                client.release();
+                            }
+
+                        } else if (['canceled', 'error', 'refunded', 'expired'].includes(depixStatus.status)) {
+                            // Payment failed
+                            await this.dbPool.query(
+                                `UPDATE verification_transactions
+                                SET verification_status = 'FAILED',
+                                    updated_at = NOW()
+                                WHERE verification_id = $1`,
+                                [verification.verification_id]
+                            );
+                            failed++;
+                        } else {
+                            // Still pending in Depix
+                            pending++;
+                        }
+
+                    } catch (error) {
+                        // 404 or other error - payment likely expired/not found
+                        if (error.message.includes('404')) {
+                            // Mark as expired if it's been more than 2 hours
+                            const ageHours = (Date.now() - new Date(verification.created_at).getTime()) / (1000 * 60 * 60);
+                            if (ageHours > 2) {
+                                await this.dbPool.query(
+                                    `UPDATE verification_transactions
+                                    SET verification_status = 'EXPIRED',
+                                        updated_at = NOW()
+                                    WHERE verification_id = $1`,
+                                    [verification.verification_id]
+                                );
+                                failed++;
+                            }
+                        } else {
+                            logger.error(`[ScheduledJobs] Error polling verification ${verification.verification_id}: ${error.message}`);
+                        }
+                    }
+                }
+
+                if (completed > 0 || failed > 0) {
+                    logger.info(`[ScheduledJobs] Verification polling: ${completed} completed, ${failed} failed, ${pending} still pending`);
+                }
+
+                await this.trackJobExecution('verification_polling', {
+                    success: true,
+                    completed,
+                    failed,
+                    pending,
+                    executedAt: new Date().toISOString()
+                });
+
+            } catch (error) {
+                logger.error('[ScheduledJobs] Verification polling failed:', error);
+
+                await this.trackJobExecution('verification_polling', {
+                    success: false,
+                    error: error.message,
+                    executedAt: new Date().toISOString()
+                });
+            }
+        });
+
+        this.jobs.set('verification_polling', pollingJob);
+        logger.info('[ScheduledJobs] Verification polling scheduled every 5 minutes (webhook fallback)');
     }
 
     /**
