@@ -18,8 +18,8 @@ const uxService = require('../services/userExperienceService');
 const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expirationQueue) => {
     const { qrId, status } = webhookData;
     const blockchainTxID = webhookData.blockchainTxID || null;
-    const payerCpfCnpj = webhookData.payer?.cpfCnpj || null;
-    const payerName = webhookData.payer?.name || null;
+    const payerCpfCnpj = webhookData.payerTaxNumber || null;
+    const payerName = webhookData.payerName || null;
 
     if (!qrId) {
         logger.error('[Process] Missing qrId in webhook data.');
@@ -260,9 +260,9 @@ const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expira
  */
 const processVerificationWebhook = async (verification, webhookData, dbPool, bot) => {
     const { verification_id, telegram_user_id, verification_status } = verification;
-    const { status, payer } = webhookData;
+    const { status, payerTaxNumber, payerName: webhookPayerName } = webhookData;
 
-    logger.info(`[ProcessVerification] Processing verification ${verification_id} with status ${status}, payer data: ${JSON.stringify(payer)}`);
+    logger.info(`[ProcessVerification] Processing verification ${verification_id} with status ${status}, payer data: ${JSON.stringify({payerTaxNumber, payerName: webhookPayerName})}`);
 
     if (verification_status !== 'PENDING') {
         logger.info(`[Process] Verification ${verification_id} already processed.`);
@@ -277,8 +277,8 @@ const processVerificationWebhook = async (verification, webhookData, dbPool, bot
         // Accept depix_sent even without payer data for verification
         if (status === 'depix_sent') {
             // Get payer info if available
-            const payerCpf = payer?.cpfCnpj || null;
-            const payerName = payer?.name || null;
+            const payerCpf = payerTaxNumber || null;
+            const payerName = webhookPayerName || null;
 
             // Update user as verified
             await client.query(
