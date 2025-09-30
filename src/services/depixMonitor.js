@@ -4,7 +4,7 @@ const depixApiService = require('./depixApiService');
 class DepixMonitor {
     constructor() {
         this.intervalId = null;
-        this.PING_INTERVAL = 65000; // 65 segundos para evitar rate limit de 60s
+        this.PING_INTERVAL = 90000; // 90 segundos para evitar rate limit com múltiplas instâncias
         this.dbPool = null; // Will be set via setDbPool method
     }
 
@@ -42,8 +42,8 @@ class DepixMonitor {
                 const lastPing = lastPingResult.rows[0].last_ping_at;
                 const timeSinceLastPing = Date.now() - new Date(lastPing).getTime();
 
-                // Se o último ping foi há menos de 60 segundos, pular
-                if (timeSinceLastPing < 60000) {
+                // Se o último ping foi há menos de 75 segundos, pular (margem de segurança com cluster)
+                if (timeSinceLastPing < 75000) {
                     logger.info(`Skipping DePix ping, last ping was ${Math.floor(timeSinceLastPing/1000)}s ago`);
                     return;
                 }

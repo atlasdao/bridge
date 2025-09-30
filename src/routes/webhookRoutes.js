@@ -526,6 +526,7 @@ const createWebhookRoutes = (bot, dbPool, expectationQueue, expirationQueue) => 
             }
 
             logger.info(`[Router-${config.app.nodeEnv}] Webhook authorized.`);
+            logger.info(`[Router-${config.app.nodeEnv}] Webhook payload: ${JSON.stringify(req.body)}`);
 
             const webhookData = req.body;
             const { qrId } = webhookData;
