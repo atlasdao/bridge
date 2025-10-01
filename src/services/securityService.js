@@ -59,6 +59,17 @@ async function checkBlacklist(dbPool, params) {
  */
 async function checkUserCanTransact(dbPool, userId, amount) {
     try {
+        // FIRST: Force reset of daily limits if needed (before any checks)
+        // This ensures limits are always fresh, even if cron job fails
+        await dbPool.query(
+            `UPDATE users
+            SET daily_used_brl = 0,
+                last_limit_reset = CURRENT_TIMESTAMP
+            WHERE (telegram_user_id = $1 OR telegram_id = $1)
+                AND last_limit_reset < CURRENT_DATE`,
+            [userId]
+        );
+
         // Primeiro buscar informações do usuário
         const userResult = await dbPool.query(
             `SELECT
