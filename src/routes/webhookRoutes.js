@@ -264,9 +264,17 @@ const processVerificationWebhook = async (verification, webhookData, dbPool, bot
 
     logger.info(`[ProcessVerification] Processing verification ${verification_id} with status ${status}, payer data: ${JSON.stringify({payerTaxNumber, payerName: webhookPayerName})}`);
 
-    if (verification_status !== 'PENDING') {
-        logger.info(`[Process] Verification ${verification_id} already processed.`);
-        return { success: true, message: 'Verification already processed.' };
+    // Allow processing for EXPIRED/FAILED verifications if we receive a successful payment
+    // Only reject if already COMPLETED
+    if (verification_status === 'COMPLETED') {
+        logger.info(`[Process] Verification ${verification_id} already completed successfully.`);
+        return { success: true, message: 'Verification already completed.' };
+    }
+
+    // For EXPIRED or FAILED status, only process if we have a successful payment
+    if ((verification_status === 'EXPIRED' || verification_status === 'FAILED') && status !== 'depix_sent') {
+        logger.info(`[Process] Verification ${verification_id} is ${verification_status} and webhook status is ${status}. Skipping.`);
+        return { success: true, message: 'Verification expired/failed, waiting for successful payment.' };
     }
 
     const client = await dbPool.connect();
