@@ -9,6 +9,21 @@ const { generateCustomQRCode } = require('../services/qrCodeGenerator');
 const uxService = require('../services/userExperienceService');
 const UserValidation = require('../utils/userValidation');
 const InputValidator = require('../utils/inputValidator');
+const WithdrawalService = require('../services/withdrawalService');
+const BountyService = require('../services/bountyService');
+
+// Helper para nome amigável do tipo de chave PIX
+const getPixKeyTypeName = (type) => {
+    const names = {
+        'PHONE': 'Celular',
+        'EMAIL': 'E-mail',
+        'CPF': 'CPF',
+        'CNPJ': 'CNPJ',
+        'RANDOM': 'Aleatória',
+        'AMBIGUOUS_CPF_PHONE': 'CPF/Celular'
+    };
+    return names[type] || type;
+};
 
 const validateMonetaryAmount = (value, options = {}) => {
     const { minValue = 0, maxValue = Number.MAX_VALUE, maxDecimals = 2 } = options;
@@ -67,9 +82,14 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
         }
     };
 
+    // BountyService para sugestões de usuários
+    const bountyServiceEarly = new BountyService(dbPool, bot);
+
     // Menu principal para usuários validados
     const mainMenuKeyboardObj = Markup.inlineKeyboard([
         [Markup.button.callback('💸 Comprar Depix Liquid', 'receive_pix_start')],
+        // [Markup.button.callback('💰 Sacar (DePix → PIX)', 'withdrawal_start')], // TODO: Habilitar quando pronto
+        [Markup.button.callback('🚀 Impulsionar Atlas', 'user_bounties')],
         [Markup.button.callback('📊 Meu Status', 'user_status')],
         [Markup.button.callback('💼 Minha Carteira', 'my_wallet')],
         [Markup.button.callback('ℹ️ Sobre o Bridge', 'about_bridge')],
@@ -301,6 +321,12 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
 
 
 
+    // Comando de teste para saque
+    bot.command('testsaque', async (ctx) => {
+        logger.info(`[TestSaque] Recebido de ${ctx.from.id}`);
+        await ctx.reply('Teste de saque OK!');
+    });
+
     bot.command('status', async (ctx) => {
         // Enhanced status check with progress indicators
         try {
@@ -398,13 +424,13 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
         }
     });
 
-    bot.on('text', async (ctx) => {
+    bot.on('text', async (ctx, next) => {
         const text = ctx.message.text.trim();
         const telegramUserId = ctx.from.id;
         const telegramUsername = ctx.from.username || 'N/A';
         const userState = awaitingInputForUser[telegramUserId];
 
-        if (text.startsWith('/')) { clearUserState(telegramUserId); return; }
+        if (text.startsWith('/')) { clearUserState(telegramUserId); return next(); }
         logger.info(`Text input from User ${telegramUserId}: "${text}" in state: ${JSON.stringify(userState)}`);
         
         // Apagar mensagem do usuário para manter o chat limpo (exceto comandos)
@@ -514,17 +540,11 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
                     const progressBar2 = uxService.formatProgressBar(40);
                     await ctx.telegram.editMessageText(ctx.chat.id, messageIdToUpdate, undefined, `Verificando DePix ${progressBar2}`);
 
-                    // Verificar status mas não bloquear se offline
-                    const depixOnline = await depixMonitor.getStatus();
-                    if (!depixOnline) {
-                        logger.warn('DePix appears offline but attempting to generate QR code anyway');
-                    }
-
                     const progressBar3 = uxService.formatProgressBar(60);
                     await ctx.telegram.editMessageText(ctx.chat.id, messageIdToUpdate, undefined, `Gerando QR Code ${progressBar3}`);
                                         
                     const userResult = await dbPool.query(
-                        'SELECT liquid_address, payer_name, payer_cpf_cnpj FROM users WHERE telegram_user_id = $1',
+                        'SELECT liquid_address, payer_name, payer_cpf_cnpj, euid, contribution_fee FROM users WHERE telegram_user_id = $1',
                         [telegramUserId]
                     );
                     if (!userResult.rows.length || !userResult.rows[0].liquid_address) {
@@ -534,22 +554,38 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
                     }
 
                     const userLiquidAddress = userResult.rows[0].liquid_address;
+                    const contributionFee = parseFloat(userResult.rows[0].contribution_fee) || 0;
                     const amountInCents = Math.round(amount * 100);
                     const progressBar4 = uxService.formatProgressBar(80);
                     await ctx.telegram.editMessageText(ctx.chat.id, messageIdToUpdate, undefined, `Finalizando ${progressBar4}`);
 
-                    // Incluir dados do pagador se disponíveis (usuário verificado)
+                    // Lógica de identificação:
+                    // 1. Se tem EUID: usa EUID (apenas dono do EUID paga)
+                    // 2. Se não tem EUID: QR aberto (EUID será capturado do webhook)
+                    // Nota: Eulen alterou regras - CPF não é mais usado para identificação
                     const userInfo = {};
-                    if (userResult.rows[0].payer_name && userResult.rows[0].payer_cpf_cnpj) {
-                        userInfo.payerName = userResult.rows[0].payer_name;
-                        userInfo.payerDocument = userResult.rows[0].payer_cpf_cnpj;
+
+                    if (userResult.rows[0].euid && userResult.rows[0].euid.trim() !== '') {
+                        userInfo.euid = userResult.rows[0].euid;
                     }
+                    // Não enviar mais CPF/nome - Eulen não usa mais para identificação
+
+                    // Adicionar contribuição se configurada
+                    if (contributionFee > 0) {
+                        userInfo.contributionFee = contributionFee;
+                    }
+
+                    // Calcular valor da contribuição em BRL
+                    const contributionAmountBrl = contributionFee > 0 ? (amount * contributionFee / 100) : 0;
 
                     const webhookUrl = `${config.app.baseUrl}/webhooks/depix_payment`;
                     const pixData = await depixApiService.generatePixForDeposit(amountInCents, userLiquidAddress, webhookUrl, userInfo);
                     const { qrCopyPaste, qrImageUrl, id: depixApiEntryId } = pixData;
-                    
-                    const dbResult = await dbPool.query( 'INSERT INTO pix_transactions (user_id, requested_brl_amount, depix_amount_expected, pix_qr_code_payload, payment_status, depix_api_entry_id) VALUES ($1, $2, $3, $4, $5, $6) RETURNING transaction_id', [telegramUserId, amount, (amount - 0.99), qrCopyPaste, 'PENDING', depixApiEntryId]);
+
+                    const dbResult = await dbPool.query(
+                        'INSERT INTO pix_transactions (user_id, requested_brl_amount, depix_amount_expected, pix_qr_code_payload, payment_status, depix_api_entry_id, contribution_fee_percent, contribution_amount_brl) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING transaction_id',
+                        [telegramUserId, amount, (amount - 0.99), qrCopyPaste, 'PENDING', depixApiEntryId, contributionFee, contributionAmountBrl]
+                    );
                     const internalTxId = dbResult.rows[0].transaction_id;
                     logger.info(`Transaction ${internalTxId} for BRL ${amount.toFixed(2)} saved. DePix API ID: ${depixApiEntryId}`);
 
@@ -562,7 +598,7 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
 
                     let caption = `💸 **PIX \\- R\\$ ${escapeMarkdownV2(amount.toFixed(2))}**\n\n`;
                     caption += `📱 Escaneie com seu banco\n`;
-                    caption += `⏱️ Validade: 19 minutos\n\n`;
+                    caption += `⏱️ Validade: 29 minutos\n\n`;
                     caption += `**PIX Copia e Cola:**\n`;
                     caption += `\`${escapeMarkdownV2(qrCopyPaste)}\``;
                     
@@ -602,8 +638,8 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
                 } catch (apiError) {
                     clearUserState(telegramUserId);
                     logError('generate_pix_api_call_or_ping', apiError, ctx);
-                    // Se falhou ao gerar o QR, mostrar mensagem de instabilidade
-                    const errorReply = 'O serviço DePix parece estar instável. Tente novamente mais tarde.';
+                    // Se falhou ao gerar o QR, mostrar mensagem genérica
+                    const errorReply = 'Ops! Tente novamente.';
                     if (messageIdToUpdate) await ctx.telegram.editMessageText(ctx.chat.id, messageIdToUpdate, undefined, errorReply);
                     else await ctx.reply(errorReply);
                 }
@@ -640,6 +676,407 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
             } else {
                 await ctx.replyWithMarkdownV2(`O endereço fornecido não parece ser uma carteira Liquid válida\\. Verifique o formato e tente novamente\\.`, Markup.inlineKeyboard([[Markup.button.callback('❌ Preciso de Ajuda com Carteira', 'explain_liquid_wallet')]]));
             }
+        } else if (userState && userState.type === 'custom_contribution') {
+            // Handler para porcentagem de contribuição personalizada
+            const cleanedText = text.replace(',', '.').replace('%', '').trim();
+            const newFee = parseFloat(cleanedText);
+
+            if (isNaN(newFee) || newFee < 0 || newFee > 20) {
+                await ctx.reply('❌ Valor inválido. Digite um número entre 0 e 20.');
+                return;
+            }
+
+            try {
+                // Buscar taxa atual
+                const currentResult = await dbPool.query(
+                    'SELECT contribution_fee FROM users WHERE telegram_user_id = $1',
+                    [telegramUserId]
+                );
+                const currentFee = parseFloat(currentResult.rows[0]?.contribution_fee) || 0;
+
+                // Atualizar a contribuição
+                await dbPool.query(
+                    'UPDATE users SET contribution_fee = $1, updated_at = NOW() WHERE telegram_user_id = $2',
+                    [newFee, telegramUserId]
+                );
+
+                let message;
+                if (newFee === 0) {
+                    message = `✅ Contribuição desativada\\.\n\n` +
+                        `Você pode reativar a qualquer momento no menu de contribuições\\.`;
+                } else if (newFee > currentFee) {
+                    message = `🎉 *Obrigado\\!*\n\n` +
+                        `Sua contribuição foi aumentada de ${escapeMarkdownV2(currentFee.toFixed(2))}% para *${escapeMarkdownV2(newFee.toFixed(2))}%*\\!\n\n` +
+                        `💝 Sua generosidade ajuda a manter o projeto\\!`;
+                } else {
+                    message = `✅ Contribuição atualizada para *${escapeMarkdownV2(newFee.toFixed(2))}%*\\.`;
+                }
+
+                // Editar mensagem original se possível
+                if (userState.messageIdToEdit) {
+                    try {
+                        await ctx.telegram.editMessageText(
+                            ctx.chat.id,
+                            userState.messageIdToEdit,
+                            undefined,
+                            message,
+                            {
+                                parse_mode: 'MarkdownV2',
+                                ...Markup.inlineKeyboard([
+                                    [Markup.button.callback('⬅️ Voltar ao Menu', 'contribution_menu')]
+                                ])
+                            }
+                        );
+                    } catch (e) {
+                        await ctx.replyWithMarkdownV2(message);
+                    }
+                } else {
+                    await ctx.replyWithMarkdownV2(message);
+                }
+
+                // Deletar mensagem do usuário
+                try {
+                    await ctx.deleteMessage();
+                } catch (e) {
+                    // Ignorar se não conseguir deletar
+                }
+
+                logger.info(`[CONTRIBUTION] User ${telegramUserId} set custom contribution to ${newFee}%`);
+                clearUserState(telegramUserId);
+
+            } catch (error) {
+                logError('custom_contribution_handler', error, ctx);
+                await ctx.reply('❌ Erro ao atualizar contribuição. Tente novamente.');
+            }
+        } else if (userState && userState.type === 'withdrawal_amount') {
+            // Handler para valor de saque
+            const cleanedText = text.replace(',', '.').replace('R$', '').replace('r$', '').trim();
+            const amount = parseFloat(cleanedText);
+
+            if (isNaN(amount) || amount < 100 || amount > 5940) {
+                await ctx.reply('❌ Entre R$ 100 e R$ 5.940');
+                return;
+            }
+
+            setUserState(telegramUserId, {
+                type: 'withdrawal_pix_key',
+                messageIdToEdit: userState.messageIdToEdit,
+                amount: amount
+            });
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('⬅️ Voltar', 'withdrawal_start')]
+            ]);
+
+            const pixMsg = `💸 *R$ ${amount.toLocaleString('pt-BR')}*\n\nPra qual chave PIX?`;
+
+            try {
+                if (userState.messageIdToEdit) {
+                    await ctx.telegram.editMessageText(
+                        ctx.chat.id,
+                        userState.messageIdToEdit,
+                        undefined,
+                        pixMsg,
+                        { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
+                    );
+                } else {
+                    await ctx.reply(pixMsg, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+                }
+            } catch (e) {
+                await ctx.reply(pixMsg, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+            }
+
+        } else if (userState && userState.type === 'withdrawal_pix_key') {
+            // Handler para chave PIX de saque
+            const detectedType = InputValidator.detectPixKeyType(text);
+
+            // Se for ambíguo (11 dígitos), perguntar ao usuário
+            if (detectedType === 'AMBIGUOUS_CPF_PHONE') {
+                setUserState(telegramUserId, {
+                    ...userState,
+                    type: 'withdrawal_pix_key_confirm_type',
+                    ambiguousKey: text.trim()
+                });
+
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('📱 Celular', 'wd_keytype:PHONE')],
+                    [Markup.button.callback('🪪 CPF', 'wd_keytype:CPF')],
+                    [Markup.button.callback('⬅️ Voltar', 'withdrawal_start')]
+                ]);
+
+                const askMsg = `🤔 *${text.trim()}*\n\nÉ CPF ou Celular?`;
+
+                try {
+                    if (userState.messageIdToEdit) {
+                        await ctx.telegram.editMessageText(
+                            ctx.chat.id,
+                            userState.messageIdToEdit,
+                            undefined,
+                            askMsg,
+                            { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
+                        );
+                    } else {
+                        await ctx.reply(askMsg, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+                    }
+                } catch (e) {
+                    await ctx.reply(askMsg, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+                }
+                return;
+            }
+
+            const pixValidation = InputValidator.validatePixKey(text);
+
+            if (!pixValidation.valid) {
+                await ctx.reply(`❌ ${pixValidation.error}`);
+                return;
+            }
+
+            const amount = userState.amount;
+            const withdrawalServiceLocal = new WithdrawalService(dbPool);
+            const fees = withdrawalServiceLocal.calculateFees(amount);
+
+            setUserState(telegramUserId, {
+                type: 'withdrawal_confirm',
+                amount: amount,
+                pixKey: pixValidation.normalized,
+                pixKeyType: pixValidation.type,
+                fees: fees
+            });
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('✅ Confirmar', 'withdrawal_confirm')],
+                [Markup.button.callback('⬅️ Voltar', 'withdrawal_start')]
+            ]);
+
+            const confirmMsg =
+                `💸 *Confirma?*\n\n` +
+                `Você envia: *${fees.totalDepixRequired.toFixed(2)} DePix*\n` +
+                `Você recebe: *R$ ${amount.toFixed(2)}*\n` +
+                `PIX: \`${pixValidation.normalized}\` (${getPixKeyTypeName(pixValidation.type)})\n\n` +
+                `_Taxa: R$ ${(fees.ourFeeAmount + fees.networkFeeAmount).toFixed(2)} (2,5% + rede)_`;
+
+            try {
+                if (userState.messageIdToEdit) {
+                    await ctx.telegram.editMessageText(
+                        ctx.chat.id,
+                        userState.messageIdToEdit,
+                        undefined,
+                        confirmMsg,
+                        { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
+                    );
+                } else {
+                    await ctx.reply(confirmMsg, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+                }
+            } catch (e) {
+                await ctx.reply(confirmMsg, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+            }
+
+        } else if (userState && userState.type === 'bounty_suggest_title') {
+            // Handler para título de sugestão de projeto
+            const title = text.trim();
+
+            if (title.length < 5) {
+                await ctx.reply('❌ Título muito curto. Mínimo de 5 caracteres.');
+                return;
+            }
+
+            if (title.length > 40) {
+                await ctx.reply('❌ Título muito longo. Máximo de 40 caracteres.');
+                return;
+            }
+
+            // Rate limiting: máximo 3 sugestões por dia
+            try {
+                const todaySuggestions = await dbPool.query(`
+                    SELECT COUNT(*) as count FROM bounty_features
+                    WHERE creator_telegram_id = $1
+                    AND created_at > NOW() - INTERVAL '24 hours'
+                `, [telegramUserId]);
+
+                if (parseInt(todaySuggestions.rows[0].count) >= 3) {
+                    clearUserState(telegramUserId);
+                    await ctx.reply(
+                        '⚠️ *Limite diário atingido*\n\n' +
+                        'Você já sugeriu 3 projetos nas últimas 24h.\n' +
+                        'Aguarde um pouco para enviar novas sugestões.',
+                        { parse_mode: 'Markdown' }
+                    );
+                    return;
+                }
+            } catch (e) {
+                logger.error(`[Bounty Suggest] Rate limit check error: ${e.message}`);
+            }
+
+            // Salvar título e passar para próximo passo
+            setUserState(telegramUserId, {
+                type: 'bounty_suggest_desc',
+                title: title,
+                messageIdToEdit: userState.messageIdToEdit
+            });
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('❌ Cancelar', 'user_bounties')]
+            ]);
+
+            await ctx.reply(
+                `✅ Título: *${title}*\n\n` +
+                `📝 Agora descreva o projeto (30-800 caracteres):\n\n` +
+                `_O que precisa ser feito? Por que é importante?_`,
+                { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
+            );
+
+        } else if (userState && userState.type === 'bounty_suggest_desc') {
+            // Handler para descrição de sugestão de projeto
+            const description = text.trim();
+
+            if (description.length < 30) {
+                await ctx.reply('❌ Descrição muito curta. Mínimo de 30 caracteres.');
+                return;
+            }
+
+            if (description.length > 800) {
+                const excess = description.length - 800;
+
+                // Botão que copia o texto para o clipboard
+                const keyboard = {
+                    inline_keyboard: [
+                        [{
+                            text: '📋 Copiar meu texto',
+                            copy_text: { text: description }
+                        }],
+                        [{
+                            text: '❌ Cancelar',
+                            callback_data: 'user_bounties'
+                        }]
+                    ]
+                };
+
+                await ctx.reply(
+                    `❌ *Descrição muito longa\\!*\n\n` +
+                    `📊 Seu texto: *${description.length}* caracteres\n` +
+                    `📏 Limite: *800* caracteres\n` +
+                    `✂️ Remova: *${excess}* caracteres\n\n` +
+                    `Clique no botão abaixo para copiar seu texto, edite e envie novamente\\.\n\n` +
+                    `_Título "${userState.title.replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, '\\$1')}" mantido\\._`,
+                    { parse_mode: 'MarkdownV2', reply_markup: keyboard }
+                );
+
+                return;
+            }
+
+            const title = userState.title;
+
+            try {
+                // Criar sugestão via bountyService
+                const bounty = await bountyServiceEarly.createBounty({
+                    title: title,
+                    description: description,
+                    createdByTelegramId: telegramUserId,
+                    createdByUsername: telegramUsername
+                });
+
+                clearUserState(telegramUserId);
+
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('🚀 Ver Projetos', 'user_bounties')],
+                    [Markup.button.callback('⬅️ Menu Principal', 'back_to_main_menu')]
+                ]);
+
+                await ctx.reply(
+                    `🎉 *Sugestão enviada!*\n\n` +
+                    `Título: *${title}*\n\n` +
+                    `Sua ideia foi registrada e será analisada pela equipe.\n` +
+                    `Se aprovada, aparecerá na lista de projetos para receber contribuições.\n\n` +
+                    `_Obrigado por ajudar a melhorar a Atlas!_`,
+                    { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
+                );
+
+                logger.info(`[Bounty Suggest] User ${telegramUserId} (@${telegramUsername}) suggested: "${title}"`);
+
+            } catch (error) {
+                logError('bounty_suggest_desc', error, ctx);
+                await ctx.reply('❌ Erro ao enviar sugestão. Tente novamente.');
+            }
+
+        } else if (userState && userState.type === 'bounty_vote_pix_amount') {
+            // Handler para valor PIX do voto em bounty
+            const cleanedText = text.trim().replace(',', '.');
+            const amount = parseFloat(cleanedText);
+
+            if (isNaN(amount) || amount <= 0) {
+                await ctx.reply('❌ Valor inválido. Digite um número válido (ex: 50 ou 100.50)');
+                return;
+            }
+
+            if (amount < config.bounties.minPixAmountBrl) {
+                await ctx.reply(`❌ Valor mínimo é R$ ${config.bounties.minPixAmountBrl.toFixed(2)}`);
+                return;
+            }
+
+            if (amount > config.bounties.maxPixAmountBrl) {
+                await ctx.reply(`❌ Valor máximo é R$ ${config.bounties.maxPixAmountBrl.toFixed(2)}`);
+                return;
+            }
+
+            try {
+                const result = await bountyServiceEarly.createPixPayment(
+                    userState.bountyId,
+                    telegramUserId,
+                    telegramUsername,
+                    amount
+                );
+
+                const { payment, pixData } = result;
+                const qrCode = pixData.qrCode;
+                const qrCodeImage = pixData.qrCodeImage;
+                const expiresAt = pixData.expiresAt;
+
+                // Formatar data de expiração
+                const expireDate = new Date(expiresAt);
+                const expireStr = expireDate.toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('⬅️ Voltar', `bounty_contribute:${userState.bountyId}`)]
+                ]);
+
+                // Enviar QR code como imagem se disponível
+                if (qrCodeImage && qrCodeImage.startsWith('data:image')) {
+                    const base64Data = qrCodeImage.replace(/^data:image\/\w+;base64,/, '');
+                    const imageBuffer = Buffer.from(base64Data, 'base64');
+
+                    await ctx.replyWithPhoto(
+                        { source: imageBuffer },
+                        {
+                            caption: `💳 *Contribuição PIX*\n\n` +
+                                `*Valor:* R$ ${amount.toFixed(2)}\n` +
+                                `*Expira:* ${expireStr}`,
+                            parse_mode: 'Markdown'
+                        }
+                    );
+
+                    await ctx.reply(
+                        `\`${qrCode}\`\n\n` +
+                        `_Toque para copiar e cole no app do banco_`,
+                        { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
+                    );
+                } else {
+                    // Fallback sem imagem
+                    await ctx.reply(
+                        `💳 *Contribuição PIX*\n\n` +
+                        `*Valor:* R$ ${amount.toFixed(2)}\n` +
+                        `*Expira:* ${expireStr}\n\n` +
+                        `\`${qrCode}\`\n\n` +
+                        `_Toque para copiar e cole no app do banco_`,
+                        { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
+                    );
+                }
+            } catch (error) {
+                logError('bounty_vote_pix_amount', error, ctx);
+                await ctx.reply(`❌ Erro ao gerar PIX: ${error.message}`);
+            }
+
+            clearUserState(telegramUserId);
+
         } else {
             // Estado desconhecido ou não tratado
             clearUserState(telegramUserId);
@@ -879,7 +1316,8 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
                 const message = `**Minha Carteira Liquid Associada**\n\nSeu endereço para receber DePix é:\n\`${escapeMarkdownV2(rows[0].liquid_address)}\`\n\n*Lembre\\-se: Você tem total controle sobre esta carteira\\.*`;
                 const keyboard = Markup.inlineKeyboard([
                        [Markup.button.callback('🔄 Alterar Carteira', 'change_wallet_start')],
-                       [Markup.button.callback('📜 Histórico de Transações', 'transaction_history:0')],
+                       [Markup.button.callback('💝 Contribuição', 'contribution_menu')],
+                       [Markup.button.callback('📜 Histórico de Transações', 'transaction_history:0:all')],
                        [Markup.button.callback('⬅️ Voltar ao Menu', 'back_to_main_menu')]]);
                 if (ctx.callbackQuery?.message) await ctx.editMessageText(message, { parse_mode: 'MarkdownV2', reply_markup: keyboard.reply_markup });
                 else await ctx.replyWithMarkdownV2(message, keyboard);
@@ -901,41 +1339,485 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
             const message = 'OK\\! Por favor, envie seu **novo endereço público da carteira Liquid**\\.';
             const sentMessage = ctx.callbackQuery?.message ? await ctx.editMessageText(message, { parse_mode: 'MarkdownV2' }) : await ctx.replyWithMarkdownV2(message);
             setUserState(ctx.from.id, { type: 'liquid_address_change', messageIdToEdit: sentMessage?.message_id || null });
-        } catch (error) { 
-            logError('change_wallet_start', error, ctx); 
+        } catch (error) {
+            logError('change_wallet_start', error, ctx);
             await sendTempError(ctx);
         }
     });
-    
-    // Simplified transaction history - only show last 3
-    bot.action(/^transaction_history(?::(\d+))?$/, async (ctx) => {
+
+    // ==================== SISTEMA DE CONTRIBUIÇÃO ====================
+
+    // Constantes da competição (26/11/2024 a 26/12/2024)
+    const COMPETITION_ID = '2024-11-26_2024-12-26';
+
+    // Função para gerar opções de contribuição baseado na taxa atual
+    const getContributionOptions = (currentFee) => {
+        const INCREMENT = 0.25;
+        const MAX_FEE = 20.00;
+        const fee = parseFloat(currentFee) || 0;
+
+        if (fee === 0) {
+            return [0.25, 0.50, 0.75];
+        }
+
+        if (fee >= MAX_FEE) {
+            return [];
+        }
+
+        const options = [];
+        for (let i = 1; i <= 3; i++) {
+            const nextValue = fee + (INCREMENT * i);
+            if (nextValue <= MAX_FEE) {
+                options.push(parseFloat(nextValue.toFixed(2)));
+            }
+        }
+
+        return options;
+    };
+
+    // Função para gerar opções de redução
+    const getReduceOptions = (currentFee) => {
+        const INCREMENT = 0.25;
+        const fee = parseFloat(currentFee) || 0;
+        const options = [];
+
+        for (let f = fee - INCREMENT; f >= INCREMENT; f -= INCREMENT) {
+            options.push(parseFloat(f.toFixed(2)));
+            if (options.length >= 3) break;
+        }
+
+        return options;
+    };
+
+    // Função para buscar posição no ranking
+    const getUserRankingPosition = async (telegramUserId) => {
+        try {
+            const result = await dbPool.query(`
+                WITH ranked AS (
+                    SELECT
+                        telegram_user_id,
+                        total_contribution_brl,
+                        ROW_NUMBER() OVER (ORDER BY total_contribution_brl DESC, transaction_count DESC) as position
+                    FROM contribution_ranking
+                    WHERE competition_id = $1
+                )
+                SELECT
+                    r.position,
+                    (SELECT COUNT(*) FROM contribution_ranking WHERE competition_id = $1) as total_participants
+                FROM ranked r
+                WHERE r.telegram_user_id = $2
+            `, [COMPETITION_ID, telegramUserId]);
+
+            if (result.rows.length === 0) {
+                const countResult = await dbPool.query(
+                    'SELECT COUNT(*) as total FROM contribution_ranking WHERE competition_id = $1',
+                    [COMPETITION_ID]
+                );
+                return {
+                    position: null,
+                    isParticipating: false,
+                    totalParticipants: parseInt(countResult.rows[0].total) || 0
+                };
+            }
+
+            return {
+                position: parseInt(result.rows[0].position),
+                isParticipating: true,
+                totalParticipants: parseInt(result.rows[0].total_participants)
+            };
+        } catch (error) {
+            logger.error('[CONTRIBUTION] Error getting ranking position:', error);
+            return { position: null, isParticipating: false, totalParticipants: 0 };
+        }
+    };
+
+    // Função para atualizar ranking após transação confirmada
+    const updateContributionRanking = async (telegramUserId, contributionBrl) => {
+        try {
+            if (!contributionBrl || contributionBrl <= 0) return;
+
+            await dbPool.query(`
+                INSERT INTO contribution_ranking
+                    (telegram_user_id, competition_id, total_contribution_brl, transaction_count)
+                VALUES ($1, $2, $3, 1)
+                ON CONFLICT (telegram_user_id, competition_id)
+                DO UPDATE SET
+                    total_contribution_brl = contribution_ranking.total_contribution_brl + $3,
+                    transaction_count = contribution_ranking.transaction_count + 1,
+                    updated_at = NOW()
+            `, [telegramUserId, COMPETITION_ID, contributionBrl]);
+
+            logger.info(`[RANKING] Updated ranking for user ${telegramUserId}: +R$ ${contributionBrl}`);
+        } catch (error) {
+            logger.error('[RANKING] Error updating ranking:', error);
+        }
+    };
+
+    // Função para enviar sugestão sutil de aumento pós-transação
+    const sendContributionSuggestion = async (bot, telegramUserId, currentFee) => {
+        try {
+            const fee = parseFloat(currentFee) || 0;
+            const MAX_FEE = 20.00;
+
+            // Se já está no máximo, não sugerir
+            if (fee >= MAX_FEE) return;
+
+            // Calcular opções: +0.25% e +0.50% da atual
+            const option1 = parseFloat((fee + 0.25).toFixed(2));
+            const option2 = parseFloat((fee + 0.50).toFixed(2));
+
+            const options = [];
+            if (option1 <= MAX_FEE) options.push(option1);
+            if (option2 <= MAX_FEE) options.push(option2);
+
+            if (options.length === 0) return;
+
+            let message;
+            if (fee === 0) {
+                message = `💝 *Quer apoiar a Atlas?*\n\n` +
+                    `Sua contribuição voluntária ajuda a manter o serviço no ar e desenvolver ferramentas pró\\-liberdade\\.`;
+            } else {
+                message = `💝 *Obrigado por apoiar a Atlas\\!*\n\n` +
+                    `Quer aumentar sua contribuição?`;
+            }
+
+            const keyboard = [];
+            const optionButtons = options.map(f =>
+                Markup.button.callback(`${f.toFixed(2)}%`, `contribution_set:${f.toFixed(2)}`)
+            );
+            keyboard.push(optionButtons);
+            keyboard.push([Markup.button.callback('Agora não', 'dismiss_contribution_suggestion')]);
+
+            await bot.telegram.sendMessage(telegramUserId, message, {
+                parse_mode: 'MarkdownV2',
+                ...Markup.inlineKeyboard(keyboard)
+            });
+
+        } catch (error) {
+            logger.error('[CONTRIBUTION] Error sending suggestion:', error);
+        }
+    };
+
+    // Handler para dispensar sugestão de contribuição
+    bot.action('dismiss_contribution_suggestion', async (ctx) => {
+        try {
+            await ctx.answerCbQuery();
+            await ctx.deleteMessage();
+        } catch (error) {
+            // Ignorar erro se não conseguir apagar
+        }
+    });
+
+    // Handler principal do menu de contribuição
+    bot.action('contribution_menu', async (ctx) => {
+        try {
+            await ctx.answerCbQuery();
+            clearUserState(ctx.from.id);
+
+            const userId = ctx.from.id;
+
+            // Buscar taxa atual do usuário
+            const userResult = await dbPool.query(
+                'SELECT contribution_fee FROM users WHERE telegram_user_id = $1',
+                [userId]
+            );
+
+            const currentFee = parseFloat(userResult.rows[0]?.contribution_fee) || 0;
+
+            // Buscar posição no ranking
+            const rankingInfo = await getUserRankingPosition(userId);
+
+            // Gerar opções de taxa
+            const options = getContributionOptions(currentFee);
+
+            let message = '';
+            const keyboard = [];
+
+            if (currentFee === 0) {
+                // Usuário sem contribuição
+                message = `💝 *Contribuição com a Atlas*\n\n` +
+                    `A Atlas opera sem fins lucrativos, cobrando apenas o custo operacional de R\\$ 0,99 por transação\\.\n\n` +
+                    `Sua contribuição voluntária ajuda a:\n` +
+                    `• Manter os servidores no ar 24/7\n` +
+                    `• Desenvolver novas funcionalidades\n` +
+                    `• Financiar ferramentas pró\\-liberdade\n\n` +
+                    `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+                    `🎁 *PRESENTE DE NATAL*\n` +
+                    `O maior apoiador até 26/12 ganha\n` +
+                    `uma Hardware Wallet Jade DIY\\!\n` +
+                    `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+                    `*Contribuição atual:* Nenhuma\n\n` +
+                    `Escolha quanto deseja contribuir:`;
+            } else if (currentFee >= 20) {
+                // Usuário no máximo
+                let rankingText = '';
+                if (rankingInfo.isParticipating) {
+                    rankingText = `📊 Sua posição: \\#${rankingInfo.position}`;
+                }
+
+                message = `💝 *Contribuição com a Atlas*\n\n` +
+                    `🏆 *CONTRIBUIDOR MÁXIMO* 🏆\n\n` +
+                    `Você atingiu o nível máximo de contribuição\\!\n` +
+                    `A Atlas agradece imensamente seu apoio\\.\n\n` +
+                    `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+                    `🎁 *PRESENTE DE NATAL*\n` +
+                    `${rankingText}\n` +
+                    `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+                    `*Contribuição atual:* ${escapeMarkdownV2(currentFee.toFixed(2))}% ✓ \\(máximo\\)`;
+            } else {
+                // Usuário com contribuição ativa
+                let rankingText = '';
+                if (rankingInfo.isParticipating) {
+                    rankingText = `📊 Sua posição: \\#${rankingInfo.position} de ${rankingInfo.totalParticipants}`;
+                } else {
+                    rankingText = `📊 Você ainda não está no ranking`;
+                }
+
+                message = `💝 *Contribuição com a Atlas*\n\n` +
+                    `Obrigado por apoiar a Atlas\\! 🙏\n\n` +
+                    `Sua contribuição faz diferença real no desenvolvimento de ferramentas para a liberdade financeira\\.\n\n` +
+                    `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+                    `🎁 *PRESENTE DE NATAL*\n` +
+                    `Prêmio: Hardware Wallet Jade DIY\n\n` +
+                    `${rankingText}\n` +
+                    `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+                    `*Contribuição atual:* ${escapeMarkdownV2(currentFee.toFixed(2))}% ✓\n\n` +
+                    `Quer contribuir ainda mais?`;
+            }
+
+            // Botões de opções de taxa (se houver)
+            if (options.length > 0) {
+                const optionButtons = options.map(fee =>
+                    Markup.button.callback(`${fee.toFixed(2)}%`, `contribution_set:${fee.toFixed(2)}`)
+                );
+                keyboard.push(optionButtons);
+            }
+
+            // Botão de alterar (se tem contribuição ativa)
+            if (currentFee > 0) {
+                keyboard.push([
+                    Markup.button.callback('⚙️ Personalizar', 'contribution_reduce'),
+                    Markup.button.callback('⬅️ Voltar', 'my_wallet')
+                ]);
+            } else {
+                keyboard.push([Markup.button.callback('⬅️ Voltar', 'my_wallet')]);
+            }
+
+            await ctx.editMessageText(message, {
+                parse_mode: 'MarkdownV2',
+                ...Markup.inlineKeyboard(keyboard)
+            });
+
+        } catch (error) {
+            logError('contribution_menu', error, ctx);
+            await sendTempError(ctx);
+        }
+    });
+
+    // Handler para definir contribuição
+    bot.action(/^contribution_set:(.+)$/, async (ctx) => {
+        try {
+            await ctx.answerCbQuery();
+
+            const userId = ctx.from.id;
+            const newFee = parseFloat(ctx.match[1]);
+
+            // Validações
+            if (isNaN(newFee) || newFee < 0 || newFee > 20) {
+                await ctx.reply('❌ Valor de contribuição inválido.');
+                return;
+            }
+
+            // Buscar taxa atual
+            const currentResult = await dbPool.query(
+                'SELECT contribution_fee FROM users WHERE telegram_user_id = $1',
+                [userId]
+            );
+            const currentFee = parseFloat(currentResult.rows[0]?.contribution_fee) || 0;
+
+            // Atualizar no banco
+            await dbPool.query(
+                'UPDATE users SET contribution_fee = $1, updated_at = NOW() WHERE telegram_user_id = $2',
+                [newFee, userId]
+            );
+
+            // Determinar mensagem de confirmação
+            let message;
+            if (newFee === 0) {
+                message = `*Contribuição Desativada*\n\n` +
+                    `Sua contribuição foi desativada\\.\n\n` +
+                    `Você pode reativar a qualquer momento através do menu "Minha Carteira"\\.\n\n` +
+                    `Esperamos poder contar com seu apoio novamente no futuro\\!`;
+            } else if (currentFee === 0) {
+                // Primeira contribuição
+                message = `✅ *Contribuição Ativada\\!*\n\n` +
+                    `Sua contribuição foi definida para *${escapeMarkdownV2(newFee.toFixed(2))}%*\n\n` +
+                    `Bem\\-vindo ao time de apoiadores\\! Obrigado por contribuir com a Atlas\\. 🙏\n\n` +
+                    `A taxa será aplicada nas suas próximas transações\\.`;
+            } else if (newFee > currentFee) {
+                message = `✅ *Contribuição Aumentada\\!*\n\n` +
+                    `Sua contribuição foi alterada para *${escapeMarkdownV2(newFee.toFixed(2))}%*\n\n` +
+                    `Obrigado por apoiar o desenvolvimento da liberdade\\! Cada centavo nos ajuda a construir um futuro mais livre\\. 🙏`;
+            } else {
+                message = `✅ *Contribuição Atualizada*\n\n` +
+                    `Sua contribuição foi alterada para *${escapeMarkdownV2(newFee.toFixed(2))}%*\n\n` +
+                    `Obrigado por continuar apoiando a Atlas\\!`;
+            }
+
+            await ctx.editMessageText(message, {
+                parse_mode: 'MarkdownV2',
+                ...Markup.inlineKeyboard([
+                    [Markup.button.callback('⬅️ Voltar ao Menu', 'back_to_main_menu')]
+                ])
+            });
+
+            logger.info(`[CONTRIBUTION] User ${userId} changed contribution from ${currentFee}% to ${newFee}%`);
+
+        } catch (error) {
+            logError('contribution_set', error, ctx);
+            await sendTempError(ctx);
+        }
+    });
+
+    // Handler para reduzir/desativar contribuição
+    bot.action('contribution_reduce', async (ctx) => {
+        try {
+            await ctx.answerCbQuery();
+
+            const userId = ctx.from.id;
+
+            // Buscar taxa atual
+            const result = await dbPool.query(
+                'SELECT contribution_fee FROM users WHERE telegram_user_id = $1',
+                [userId]
+            );
+
+            const currentFee = parseFloat(result.rows[0]?.contribution_fee) || 0;
+
+            const message = `⚙️ *Personalizar Contribuição*\n\n` +
+                `*Contribuição atual:* ${escapeMarkdownV2(currentFee.toFixed(2))}%\n\n` +
+                `Digite a porcentagem desejada \\(0 a 20\\):\n` +
+                `Ex: 1\\.2 para 1\\.2%\\.`;
+
+            // Salvar estado para aguardar input
+            setUserState(userId, {
+                type: 'custom_contribution',
+                messageIdToEdit: ctx.callbackQuery.message.message_id
+            });
+
+            await ctx.editMessageText(message, {
+                parse_mode: 'MarkdownV2',
+                ...Markup.inlineKeyboard([
+                    [Markup.button.callback('⬅️ Voltar', 'contribution_menu')]
+                ])
+            });
+
+        } catch (error) {
+            logError('contribution_reduce', error, ctx);
+            await sendTempError(ctx);
+        }
+    });
+
+    // Exportar funções para uso em outros módulos (webhook)
+    bot.context.contributionHelpers = {
+        updateContributionRanking,
+        sendContributionSuggestion: (userId, fee) => sendContributionSuggestion(bot, userId, fee)
+    };
+
+    // ==================== FIM SISTEMA DE CONTRIBUIÇÃO ====================
+
+    // Transaction history with pagination and filters
+    bot.action(/^transaction_history:(\d+):?(all|approved)?$/, async (ctx) => {
         clearUserState(ctx.from.id);
         try {
             await ctx.answerCbQuery();
-            const { rows: transactions } = await dbPool.query(
-                `SELECT requested_brl_amount, payment_status, created_at
-                 FROM pix_transactions
-                 WHERE user_id = $1
-                 ORDER BY created_at DESC
-                 LIMIT 3`,
+
+            const page = parseInt(ctx.match[1]) || 0;
+            const filter = ctx.match[2] || 'all';
+            const itemsPerPage = 10;
+            const offset = page * itemsPerPage;
+
+            // Build query based on filter
+            let whereClause = 'WHERE user_id = $1';
+            if (filter === 'approved') {
+                whereClause += ` AND payment_status IN ('CONFIRMED', 'PAID')`;
+            }
+
+            // Get total count
+            const { rows: countResult } = await dbPool.query(
+                `SELECT COUNT(*) as total FROM pix_transactions ${whereClause}`,
                 [ctx.from.id]
             );
+            const totalTransactions = parseInt(countResult[0].total);
+            const totalPages = Math.ceil(totalTransactions / itemsPerPage);
 
-            let message = `📜 **Últimas Transações**\n\n`;
+            // Get transactions for current page
+            const { rows: transactions } = await dbPool.query(
+                `SELECT requested_brl_amount, payment_status, created_at, transaction_id
+                 FROM pix_transactions
+                 ${whereClause}
+                 ORDER BY created_at DESC
+                 LIMIT $2 OFFSET $3`,
+                [ctx.from.id, itemsPerPage, offset]
+            );
+
+            let message = filter === 'approved'
+                ? `📜 **Transações Aprovadas**\n\n`
+                : `📜 **Histórico de Transações**\n\n`;
 
             if (transactions.length === 0) {
-                message += `Nenhuma transação ainda\\.`;
+                message += `Nenhuma transação encontrada\\.`;
             } else {
-                transactions.forEach((tx) => {
-                    const date = new Date(tx.created_at).toLocaleDateString('pt-BR');
+                transactions.forEach((tx, index) => {
+                    const date = new Date(tx.created_at).toLocaleString('pt-BR', {
+                        day: '2-digit',
+                        month: '2-digit',
+                        year: 'numeric',
+                        hour: '2-digit',
+                        minute: '2-digit'
+                    });
                     const status = tx.payment_status === 'CONFIRMED' || tx.payment_status === 'PAID' ? '✅' :
                                  tx.payment_status === 'PENDING' ? '⏳' : '❌';
                     const amount = parseFloat(tx.requested_brl_amount);
                     message += `${status} R\\$ ${escapeMarkdownV2(amount.toFixed(2))} \\- ${escapeMarkdownV2(date)}\n`;
                 });
+
+                // Add pagination info
+                message += `\n*Página ${page + 1} de ${totalPages || 1}* \\(${totalTransactions} transações\\)`;
             }
 
-            const keyboard = Markup.inlineKeyboard([[Markup.button.callback('⬅️ Voltar', 'my_wallet')]]);
+            // Build keyboard with navigation and filters
+            const buttons = [];
+
+            // Filter buttons row
+            if (filter === 'all') {
+                buttons.push([
+                    Markup.button.callback('✅ Apenas Aprovadas', `transaction_history:0:approved`),
+                    Markup.button.callback('📥 Exportar CSV', `export_transactions:${filter}`)
+                ]);
+            } else {
+                buttons.push([
+                    Markup.button.callback('📋 Todas', `transaction_history:0:all`),
+                    Markup.button.callback('📥 Exportar CSV', `export_transactions:${filter}`)
+                ]);
+            }
+
+            // Navigation buttons row
+            const navButtons = [];
+            if (page > 0) {
+                navButtons.push(Markup.button.callback('◀️ Anterior', `transaction_history:${page - 1}:${filter}`));
+            }
+            if (page < totalPages - 1 && totalPages > 1) {
+                navButtons.push(Markup.button.callback('Próxima ▶️', `transaction_history:${page + 1}:${filter}`));
+            }
+            if (navButtons.length > 0) {
+                buttons.push(navButtons);
+            }
+
+            // Back button
+            buttons.push([Markup.button.callback('⬅️ Voltar', 'my_wallet')]);
+
+            const keyboard = Markup.inlineKeyboard(buttons);
 
             if (ctx.callbackQuery?.message) {
                 await ctx.editMessageText(message, {
@@ -949,6 +1831,79 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
             if (error.message.includes("message is not modified")) return;
             logError('transaction_history', error, ctx);
             await sendTempError(ctx);
+        }
+    });
+
+    // Export transactions to CSV
+    bot.action(/^export_transactions:(all|approved)$/, async (ctx) => {
+        try {
+            await ctx.answerCbQuery('Gerando arquivo CSV...');
+
+            const filter = ctx.match[1];
+
+            // Build query based on filter
+            let whereClause = 'WHERE user_id = $1';
+            if (filter === 'approved') {
+                whereClause += ` AND payment_status IN ('CONFIRMED', 'PAID')`;
+            }
+
+            // Get all transactions for export
+            const { rows: transactions } = await dbPool.query(
+                `SELECT requested_brl_amount, payment_status, created_at, transaction_id,
+                        depix_amount_expected, depix_txid
+                 FROM pix_transactions
+                 ${whereClause}
+                 ORDER BY created_at DESC`,
+                [ctx.from.id]
+            );
+
+            if (transactions.length === 0) {
+                await ctx.answerCbQuery('Nenhuma transação para exportar', { show_alert: true });
+                return;
+            }
+
+            // Generate CSV content
+            let csv = 'Data,Status,Valor BRL,DePix Esperado,TXID DePix,ID Transação\n';
+
+            transactions.forEach((tx) => {
+                const date = new Date(tx.created_at).toLocaleString('pt-BR', {
+                    day: '2-digit',
+                    month: '2-digit',
+                    year: 'numeric',
+                    hour: '2-digit',
+                    minute: '2-digit'
+                });
+                const statusMap = {
+                    'CONFIRMED': 'Aprovada',
+                    'PAID': 'Aprovada',
+                    'PENDING': 'Pendente',
+                    'EXPIRED': 'Expirada',
+                    'FAILED': 'Falhou'
+                };
+                const status = statusMap[tx.payment_status] || tx.payment_status;
+                const amount = parseFloat(tx.requested_brl_amount).toFixed(2);
+                const depixAmount = tx.depix_amount_expected ? parseFloat(tx.depix_amount_expected).toFixed(2) : '0.00';
+                const depixTxid = tx.depix_txid || '-';
+
+                csv += `"${date}","${status}","${amount}","${depixAmount}","${depixTxid}","${tx.transaction_id}"\n`;
+            });
+
+            // Send CSV file
+            const filename = `transacoes_${filter}_${new Date().toISOString().split('T')[0]}.csv`;
+            const buffer = Buffer.from(csv, 'utf-8');
+
+            await ctx.replyWithDocument(
+                { source: buffer, filename },
+                {
+                    caption: filter === 'approved'
+                        ? `📊 Exportação de ${transactions.length} transações aprovadas`
+                        : `📊 Exportação de ${transactions.length} transações`
+                }
+            );
+
+        } catch (error) {
+            logError('export_transactions', error, ctx);
+            await ctx.answerCbQuery('Erro ao gerar CSV. Tente novamente.', { show_alert: true });
         }
     });
     
@@ -1118,17 +2073,12 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
             // Gerar QR Code de R$ 1,00 para validação
             await ctx.editMessageText('⏳ Gerando QR Code de validação\\.\\.\\.', { parse_mode: 'MarkdownV2' });
 
-            // Verificar status mas não bloquear se offline
-            const depixOnline = await depixMonitor.getStatus();
-            if (!depixOnline) {
-                logger.warn('DePix appears offline but attempting to generate verification QR code anyway');
-            }
-            
             // Criar depósito de R$ 1,00
             const webhookUrl = `${config.app.baseUrl}/webhooks/depix_payment`;
             let pixData;
             try {
-                // Para verificação, não incluir dados do pagador ainda
+                // Validação: QR aberto (sem identificação) para permitir qualquer pessoa pagar
+                // O EUID será capturado do webhook após o pagamento
                 pixData = await depixApiService.generatePixForDeposit(100, liquidAddress, webhookUrl, {}); // 100 centavos = R$ 1,00
             } catch (error) {
                 await ctx.editMessageText('Ops! Tente novamente.');
@@ -1670,13 +2620,791 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
         }
     });
 
+    // ============================================
+    // HANDLERS DE SAQUE DEPIX → PIX
+    // ============================================
+
+    // Inicializar serviço de saques
+    const withdrawalService = new WithdrawalService(dbPool);
+
+    // Comando /saque - Saque rápido
+    bot.command('saque', async (ctx) => {
+        logger.info(`[Saque] Comando /saque recebido de ${ctx.from.id}`);
+        try {
+            const telegramUserId = ctx.from.id;
+            clearUserState(telegramUserId);
+
+            // Verificar se usuário é verificado
+            const userStatus = await securityService.getUserStatus(dbPool, telegramUserId);
+            if (!userStatus || !userStatus.is_verified) {
+                await ctx.reply('❌ Você precisa validar sua conta primeiro. Use /start');
+                return;
+            }
+
+            // Extrair parâmetros: /saque <valor> <chave_pix>
+            const commandText = ctx.message.text.trim();
+            const parts = commandText.split(/\s+/);
+
+            if (parts.length < 3) {
+                await ctx.reply(
+                    '❌ *Formato inválido*\n\n' +
+                    'Use: `/saque <valor> <chave_pix>`\n\n' +
+                    '*Exemplos:*\n' +
+                    '`/saque 500 +5511999999999` (Celular)\n' +
+                    '`/saque 500 123.456.789-00` (CPF)\n' +
+                    '`/saque 500 email@teste.com` (Email)\n' +
+                    '`/saque 500 12345678901234` (CNPJ)\n' +
+                    '`/saque 500 abc123xyz` (Aleatória)',
+                    { parse_mode: 'Markdown' }
+                );
+                return;
+            }
+
+            const valorStr = parts[1].replace(',', '.');
+            const chavePix = parts.slice(2).join(' ');
+
+            // Validar valor
+            const valor = parseFloat(valorStr);
+            if (isNaN(valor) || valor < 100 || valor > 5940) {
+                await ctx.reply('❌ Valor inválido. O saque deve ser entre R$ 100 e R$ 5.940');
+                return;
+            }
+
+            // Validar chave PIX
+            const pixValidation = InputValidator.validatePixKey(chavePix);
+            if (!pixValidation.valid) {
+                await ctx.reply(`❌ Chave PIX inválida: ${pixValidation.error}`);
+                return;
+            }
+
+            // Verificar se já tem saque pendente
+            const pendingWithdrawal = await withdrawalService.getUserPendingWithdrawal(telegramUserId);
+            if (pendingWithdrawal) {
+                await ctx.reply('❌ Você já tem um saque pendente. Aguarde a conclusão ou cancele-o.');
+                return;
+            }
+
+            // Calcular taxas
+            const fees = withdrawalService.calculateFees(valor);
+
+            // Mostrar resumo e pedir confirmação
+            setUserState(telegramUserId, {
+                type: 'withdrawal_confirm',
+                amount: valor,
+                pixKey: pixValidation.normalized,
+                pixKeyType: pixValidation.type,
+                fees: fees
+            });
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('✅ Confirmar', 'withdrawal_confirm')],
+                [Markup.button.callback('❌ Cancelar', 'withdrawal_cancel_flow')]
+            ]);
+
+            await ctx.reply(
+                `💸 *Confirma?*\n\n` +
+                `Você envia: *${fees.totalDepixRequired.toFixed(2)} DePix*\n` +
+                `Você recebe: *R$ ${valor.toFixed(2)}*\n` +
+                `PIX: \`${pixValidation.normalized}\` (${getPixKeyTypeName(pixValidation.type)})\n\n` +
+                `_Taxa: R$ ${(fees.ourFeeAmount + fees.networkFeeAmount).toFixed(2)} (2,5% + rede)_`,
+                { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
+            );
+        } catch (error) {
+            logError('command_saque', error, ctx);
+            await sendTempError(ctx);
+        }
+    });
+
+    // Action: withdrawal_start - Iniciar fluxo de saque (menu admin por enquanto)
+    bot.action('withdrawal_start', async (ctx) => {
+        try {
+            await ctx.answerCbQuery();
+            const telegramUserId = ctx.from.id;
+            clearUserState(telegramUserId);
+
+            // Verificar se usuário é verificado
+            const userStatus = await securityService.getUserStatus(dbPool, telegramUserId);
+            if (!userStatus || !userStatus.is_verified) {
+                await ctx.editMessageText(
+                    '❌ Você precisa validar sua conta primeiro.',
+                    Markup.inlineKeyboard([[Markup.button.callback('⬅️ Voltar', 'back_to_main_menu')]])
+                );
+                return;
+            }
+
+            // Verificar se já tem saque pendente
+            const pendingWithdrawal = await withdrawalService.getUserPendingWithdrawal(telegramUserId);
+            if (pendingWithdrawal) {
+                // Mapear status para texto amigável
+                const statusMap = {
+                    'AWAITING_PAYMENT': '⏳ Aguardando pagamento',
+                    'INSUFFICIENT_PAYMENT': '⚠️ Pagamento insuficiente',
+                    'EXCESS_PAYMENT': '⚠️ Pagamento em excesso',
+                    'PAYMENT_DETECTED': '✅ Pagamento detectado',
+                    'PROCESSING': '🔄 Processando',
+                    'COMPLETED': '✅ Concluído',
+                    'CANCELLED': '❌ Cancelado',
+                    'EXPIRED': '⏰ Expirado'
+                };
+                const statusText = statusMap[pendingWithdrawal.status] || pendingWithdrawal.status;
+
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('📋 Ver Saque Pendente', `withdrawal_view:${pendingWithdrawal.withdrawal_id}`)],
+                    [Markup.button.callback('❌ Cancelar Saque', `withdrawal_cancel:${pendingWithdrawal.withdrawal_id}`)],
+                    [Markup.button.callback('⬅️ Voltar', 'back_to_main_menu')]
+                ]);
+
+                await ctx.editMessageText(
+                    `⚠️ *Você já tem um saque pendente*\n\n` +
+                    `💰 Valor: R$ ${parseFloat(pendingWithdrawal.requested_pix_amount).toFixed(2)}\n` +
+                    `📱 Chave: \`${pendingWithdrawal.pix_key_value}\`\n` +
+                    `📊 Status: ${statusText}\n\n` +
+                    `Aguarde a conclusão ou cancele para iniciar um novo.`,
+                    { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
+                );
+                return;
+            }
+
+            // Mostrar menu de saque - limpo e direto
+            setUserState(telegramUserId, {
+                type: 'withdrawal_amount',
+                messageIdToEdit: ctx.callbackQuery.message.message_id
+            });
+
+            const keyboard = Markup.inlineKeyboard([
+                [
+                    Markup.button.callback('R$ 100', 'wd_val:100'),
+                    Markup.button.callback('R$ 200', 'wd_val:200'),
+                    Markup.button.callback('R$ 500', 'wd_val:500')
+                ],
+                [
+                    Markup.button.callback('R$ 1.000', 'wd_val:1000'),
+                    Markup.button.callback('R$ 2.000', 'wd_val:2000'),
+                    Markup.button.callback('Outro', 'wd_custom')
+                ],
+                [Markup.button.callback('❌ Cancelar', 'withdrawal_cancel_flow')]
+            ]);
+
+            await ctx.editMessageText(
+                `💸 *DePix → PIX*\n\n` +
+                `Quanto você quer receber?`,
+                { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
+            );
+        } catch (error) {
+            logError('withdrawal_start', error, ctx);
+            await ctx.answerCbQuery('❌ Erro ao iniciar saque');
+        }
+    });
+
+    // Action: wd_val - Valor selecionado via botão
+    bot.action(/wd_val:(\d+)/, async (ctx) => {
+        try {
+            await ctx.answerCbQuery();
+            const telegramUserId = ctx.from.id;
+            const amount = parseInt(ctx.match[1]);
+
+            setUserState(telegramUserId, {
+                type: 'withdrawal_pix_key',
+                amount: amount,
+                messageIdToEdit: ctx.callbackQuery.message.message_id
+            });
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('⬅️ Voltar', 'withdrawal_start')]
+            ]);
+
+            await ctx.editMessageText(
+                `💸 *R$ ${amount.toLocaleString('pt-BR')}*\n\n` +
+                `Pra qual chave PIX?`,
+                { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
+            );
+        } catch (error) {
+            logError('wd_val', error, ctx);
+            await ctx.answerCbQuery('❌ Erro');
+        }
+    });
+
+    // Action: wd_custom - Digitar valor
+    bot.action('wd_custom', async (ctx) => {
+        try {
+            await ctx.answerCbQuery();
+            const telegramUserId = ctx.from.id;
+
+            setUserState(telegramUserId, {
+                type: 'withdrawal_amount',
+                messageIdToEdit: ctx.callbackQuery.message.message_id
+            });
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('⬅️ Voltar', 'withdrawal_start')]
+            ]);
+
+            await ctx.editMessageText(
+                `💸 *Valor personalizado*\n\n` +
+                `Digite quanto quer receber:\n` +
+                `_(mín R$ 100 / máx R$ 5.940)_`,
+                { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
+            );
+        } catch (error) {
+            logError('wd_custom', error, ctx);
+            await ctx.answerCbQuery('❌ Erro');
+        }
+    });
+
+    // Action: wd_keytype - Usuário escolheu tipo de chave (CPF ou Celular)
+    bot.action(/wd_keytype:(PHONE|CPF)/, async (ctx) => {
+        try {
+            await ctx.answerCbQuery();
+            const telegramUserId = ctx.from.id;
+            const userState = awaitingInputForUser[telegramUserId];
+            const chosenType = ctx.match[1];
+
+            if (!userState || userState.type !== 'withdrawal_pix_key_confirm_type' || !userState.ambiguousKey) {
+                await ctx.editMessageText('❌ Sessão expirada. Tente novamente.');
+                clearUserState(telegramUserId);
+                return;
+            }
+
+            const rawKey = userState.ambiguousKey;
+            let normalizedKey;
+            let pixKeyType;
+
+            if (chosenType === 'PHONE') {
+                // Formatar como telefone: +55XXXXXXXXXXX
+                const numbersOnly = rawKey.replace(/\D/g, '');
+                normalizedKey = '+55' + numbersOnly;
+                pixKeyType = 'PHONE';
+            } else {
+                // Formatar como CPF: XXX.XXX.XXX-XX
+                const numbersOnly = rawKey.replace(/\D/g, '');
+                normalizedKey = numbersOnly.replace(/(\d{3})(\d{3})(\d{3})(\d{2})/, '$1.$2.$3-$4');
+                pixKeyType = 'CPF';
+            }
+
+            const amount = userState.amount;
+            const withdrawalServiceLocal = new WithdrawalService(dbPool);
+            const fees = withdrawalServiceLocal.calculateFees(amount);
+
+            setUserState(telegramUserId, {
+                type: 'withdrawal_confirm',
+                amount: amount,
+                pixKey: normalizedKey,
+                pixKeyType: pixKeyType,
+                fees: fees
+            });
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('✅ Confirmar', 'withdrawal_confirm')],
+                [Markup.button.callback('⬅️ Voltar', 'withdrawal_start')]
+            ]);
+
+            const confirmMsg =
+                `💸 *Confirma?*\n\n` +
+                `Você envia: *${fees.totalDepixRequired.toFixed(2)} DePix*\n` +
+                `Você recebe: *R$ ${amount.toFixed(2)}*\n` +
+                `PIX: \`${normalizedKey}\` (${getPixKeyTypeName(pixKeyType)})\n\n` +
+                `_Taxa: R$ ${(fees.ourFeeAmount + fees.networkFeeAmount).toFixed(2)} (2,5% + rede)_`;
+
+            await ctx.editMessageText(confirmMsg, {
+                parse_mode: 'Markdown',
+                reply_markup: keyboard.reply_markup
+            });
+        } catch (error) {
+            logError('wd_keytype', error, ctx);
+            await ctx.answerCbQuery('❌ Erro');
+        }
+    });
+
+    // Action: withdrawal_confirm - Confirmar saque
+    bot.action('withdrawal_confirm', async (ctx) => {
+        try {
+            await ctx.answerCbQuery();
+            const telegramUserId = ctx.from.id;
+            const userState = awaitingInputForUser[telegramUserId];
+
+            if (!userState || userState.type !== 'withdrawal_confirm') {
+                await ctx.editMessageText('❌ Sessão expirada. Use /saque novamente.');
+                clearUserState(telegramUserId);
+                return;
+            }
+
+            const { amount, pixKey, pixKeyType, fees } = userState;
+            clearUserState(telegramUserId);
+
+            // Criar saque
+            await ctx.editMessageText('⏳ Gerando endereço...');
+
+            try {
+                const withdrawal = await withdrawalService.createWithdrawal({
+                    telegramUserId,
+                    pixAmount: amount,
+                    pixKeyType,
+                    pixKeyValue: pixKey
+                });
+
+                withdrawalService.bot = ctx.telegram;
+
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('❌ Cancelar', `withdrawal_cancel:${withdrawal.withdrawal_id}`)]
+                ]);
+
+                await ctx.editMessageText(
+                    `✅ *Envie ${fees.totalDepixRequired.toFixed(2)} DePix*\n\n` +
+                    `\`${withdrawal.deposit_address}\`\n\n` +
+                    `➡️ Você recebe: *R$ ${amount.toFixed(2)}*\n` +
+                    `📱 PIX: \`${pixKey}\`\n` +
+                    `⏱ Prazo: ${withdrawal.estimatedCompletionText}\n\n` +
+                    `_Expira em 60 min • Detecção automática_`,
+                    { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
+                );
+
+                // Salvar ID da mensagem para atualizações
+                await dbPool.query(
+                    'UPDATE withdrawal_transactions SET info_message_id = $1 WHERE withdrawal_id = $2',
+                    [ctx.callbackQuery.message.message_id, withdrawal.withdrawal_id]
+                );
+
+            } catch (error) {
+                await ctx.editMessageText(`❌ Erro ao criar saque: ${error.message}`);
+            }
+        } catch (error) {
+            logError('withdrawal_confirm', error, ctx);
+            await ctx.answerCbQuery('❌ Erro ao confirmar saque');
+        }
+    });
+
+    // Action: withdrawal_cancel - Cancelar saque específico
+    bot.action(/withdrawal_cancel:(.+)/, async (ctx) => {
+        try {
+            await ctx.answerCbQuery();
+            const telegramUserId = ctx.from.id;
+            const withdrawalId = ctx.match[1];
+
+            try {
+                await withdrawalService.cancelWithdrawal(withdrawalId, telegramUserId);
+
+                await ctx.editMessageText(
+                    '✅ Saque cancelado com sucesso.\n\nVocê pode iniciar um novo saque quando quiser.',
+                    Markup.inlineKeyboard([[Markup.button.callback('⬅️ Voltar ao Menu', 'back_to_main_menu')]])
+                );
+            } catch (error) {
+                await ctx.editMessageText(`❌ ${error.message}`);
+            }
+        } catch (error) {
+            logError('withdrawal_cancel', error, ctx);
+            await ctx.answerCbQuery('❌ Erro ao cancelar saque');
+        }
+    });
+
+    // Action: withdrawal_cancel_flow - Cancelar fluxo de saque
+    bot.action('withdrawal_cancel_flow', async (ctx) => {
+        try {
+            await ctx.answerCbQuery();
+            clearUserState(ctx.from.id);
+            await sendMainMenu(ctx, 'Saque cancelado.');
+        } catch (error) {
+            logError('withdrawal_cancel_flow', error, ctx);
+        }
+    });
+
+    // Action: withdrawal_view - Ver detalhes do saque
+    bot.action(/withdrawal_view:(.+)/, async (ctx) => {
+        try {
+            await ctx.answerCbQuery();
+            const withdrawalId = ctx.match[1];
+
+            const withdrawal = await withdrawalService.getWithdrawalDetails(withdrawalId);
+            if (!withdrawal) {
+                await ctx.editMessageText('❌ Saque não encontrado.');
+                return;
+            }
+
+            const statusEmoji = {
+                'AWAITING_PAYMENT': '⏳',
+                'PAYMENT_DETECTED': '✅',
+                'PROCESSING': '🔄',
+                'COMPLETED': '✅',
+                'EXPIRED': '⏰',
+                'CANCELLED': '❌',
+                'FAILED': '❌'
+            };
+
+            const statusText = {
+                'AWAITING_PAYMENT': 'Aguardando pagamento',
+                'PAYMENT_DETECTED': 'Pagamento detectado',
+                'PROCESSING': 'Processando',
+                'COMPLETED': 'Concluído',
+                'EXPIRED': 'Expirado',
+                'CANCELLED': 'Cancelado',
+                'FAILED': 'Falhou'
+            };
+
+            let message = `📋 *Detalhes do Saque*\n\n` +
+                `${statusEmoji[withdrawal.status]} Status: ${statusText[withdrawal.status]}\n\n` +
+                `💰 Valor PIX: R$ ${parseFloat(withdrawal.requested_pix_amount).toFixed(2)}\n` +
+                `📱 Chave: ${withdrawal.pix_key_value}\n` +
+                `💸 Total DePix: ${parseFloat(withdrawal.total_depix_required).toFixed(2)}\n`;
+
+            if (withdrawal.status === 'AWAITING_PAYMENT') {
+                message += `\n📍 *Endereço para pagamento:*\n\`${withdrawal.deposit_address}\`\n`;
+            }
+
+            if (withdrawal.liquid_txid) {
+                message += `\n🔗 TXID: \`${withdrawal.liquid_txid.substring(0, 16)}...\`\n`;
+            }
+
+            const buttons = [];
+            if (withdrawal.status === 'AWAITING_PAYMENT') {
+                buttons.push([Markup.button.callback('❌ Cancelar', `withdrawal_cancel:${withdrawalId}`)]);
+            }
+            buttons.push([Markup.button.callback('⬅️ Voltar', 'back_to_main_menu')]);
+
+            await ctx.editMessageText(message, {
+                parse_mode: 'Markdown',
+                reply_markup: Markup.inlineKeyboard(buttons).reply_markup
+            });
+        } catch (error) {
+            logError('withdrawal_view', error, ctx);
+            await ctx.answerCbQuery('❌ Erro ao ver saque');
+        }
+    });
+
+    // Handler de texto para fluxo de saque
+    // Adicionado ao bot.on('text') existente - será processado no switch de estados
+
+    // ========================================
+    // MENU IMPULSIONAR ATLAS (BOUNTIES) - PARA USUÁRIOS
+    // ========================================
+    const bountyService = new BountyService(dbPool, bot);
+    const PROJECTS_PER_PAGE = 5;
+
+    // Função helper para renderizar lista de projetos com paginação
+    async function renderProjectsList(ctx, page = 0) {
+        const totalCount = await bountyService.countBounties('approved');
+
+        if (totalCount === 0) {
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('💡 Sugerir Projeto', 'user_bounty_suggest')],
+                [Markup.button.callback('⬅️ Voltar', 'back_to_main_menu')]
+            ]);
+
+            await ctx.editMessageText(
+                '🚀 *Impulsionar Atlas*\n\n' +
+                'A Atlas é sustentada por contribuições da comunidade. ' +
+                'Aqui você pode financiar projetos que quer ver prontos ou assumir trabalhos e ser remunerado.\n\n' +
+                '📭 Nenhum projeto aberto no momento.\n\n' +
+                'Tem uma ideia? Sugira um projeto!',
+                { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
+            );
+            return;
+        }
+
+        const totalPages = Math.ceil(totalCount / PROJECTS_PER_PAGE);
+        const currentPage = Math.max(0, Math.min(page, totalPages - 1));
+        const offset = currentPage * PROJECTS_PER_PAGE;
+
+        const bounties = await bountyService.listBounties('approved', PROJECTS_PER_PAGE, offset);
+
+        // Botões dos projetos
+        const buttons = bounties.map(b => {
+            const funded = parseFloat(b.total_brl || 0);
+            const progress = funded > 0 ? ` 💰 R$${funded.toFixed(0)}` : '';
+            const title = b.title.length > 25 ? b.title.substring(0, 24) + '…' : b.title;
+            return [Markup.button.callback(
+                `${title}${progress}`,
+                `user_bounty_view:${b.id}`
+            )];
+        });
+
+        // Navegação de páginas (se houver mais de uma página)
+        if (totalPages > 1) {
+            const navButtons = [];
+
+            if (currentPage > 0) {
+                navButtons.push(Markup.button.callback('◀️', `user_bounties_page:${currentPage - 1}`));
+            } else {
+                navButtons.push(Markup.button.callback(' ', 'noop'));
+            }
+
+            navButtons.push(Markup.button.callback(`${currentPage + 1}/${totalPages}`, 'noop'));
+
+            if (currentPage < totalPages - 1) {
+                navButtons.push(Markup.button.callback('▶️', `user_bounties_page:${currentPage + 1}`));
+            } else {
+                navButtons.push(Markup.button.callback(' ', 'noop'));
+            }
+
+            buttons.push(navButtons);
+        }
+
+        // Botões de ação
+        buttons.push([Markup.button.callback('💡 Sugerir Projeto', 'user_bounty_suggest')]);
+        buttons.push([Markup.button.callback('⬅️ Voltar', 'back_to_main_menu')]);
+
+        await ctx.editMessageText(
+            '🚀 *Impulsionar Atlas*\n\n' +
+            'A Atlas é sustentada por contribuições da comunidade. ' +
+            'Escolha um projeto para contribuir ou assumir:\n\n' +
+            `📊 ${totalCount} projeto${totalCount > 1 ? 's' : ''} aberto${totalCount > 1 ? 's' : ''}`,
+            { parse_mode: 'Markdown', reply_markup: Markup.inlineKeyboard(buttons).reply_markup }
+        );
+    }
+
+    bot.action('user_bounties', async (ctx) => {
+        try {
+            clearUserState(ctx.from.id); // Limpar estado pendente (ex: sugestão cancelada)
+            await ctx.answerCbQuery();
+            await renderProjectsList(ctx, 0);
+        } catch (error) {
+            logError('user_bounties', error, ctx);
+            await ctx.answerCbQuery('❌ Erro ao carregar projetos');
+        }
+    });
+
+    // Paginação
+    bot.action(/^user_bounties_page:(\d+)$/, async (ctx) => {
+        try {
+            await ctx.answerCbQuery();
+            const page = parseInt(ctx.match[1]);
+            await renderProjectsList(ctx, page);
+        } catch (error) {
+            logError('user_bounties_page', error, ctx);
+            await ctx.answerCbQuery('❌ Erro');
+        }
+    });
+
+    // Handler vazio para botões de navegação desabilitados
+    bot.action('noop', async (ctx) => {
+        await ctx.answerCbQuery();
+    });
+
+    // Ver detalhes de um bounty (usuário)
+    bot.action(/^user_bounty_view:(\d+)$/, async (ctx) => {
+        try {
+            await ctx.answerCbQuery();
+            const bountyId = parseInt(ctx.match[1]);
+            const bounty = await bountyService.getBountyById(bountyId);
+
+            if (!bounty || bounty.status !== 'approved') {
+                return ctx.editMessageText('❌ Projeto não encontrado ou não está disponível.');
+            }
+
+            const escapeMarkdown = (text) => {
+                if (!text) return '';
+                return text.replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
+            };
+
+            const totalBrl = parseFloat(bounty.total_brl || 0).toFixed(2).replace('.', '\\.');
+            const votes = bounty.vote_count || 0;
+
+            const message =
+                `🎯 *${escapeMarkdown(bounty.title)}*\n\n` +
+                `${escapeMarkdown(bounty.short_description?.substring(0, 500) || '')}\n\n` +
+                `💰 *Arrecadado:* R\\$ ${totalBrl}\n` +
+                `👥 *Contribuições:* ${votes}\n\n` +
+                `_Escolha como quer participar:_`;
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('💰 Quero Contribuir', `bounty_contribute:${bountyId}`)],
+                [Markup.button.callback('🛠️ Quero Trabalhar', `bounty_work:${bountyId}`)],
+                [Markup.button.callback('⬅️ Voltar', 'user_bounties')]
+            ]);
+
+            await ctx.editMessageText(message, {
+                parse_mode: 'MarkdownV2',
+                reply_markup: keyboard.reply_markup
+            });
+        } catch (error) {
+            logError('user_bounty_view', error, ctx);
+            await ctx.answerCbQuery('❌ Erro ao carregar projeto');
+        }
+    });
+
+    // Sugerir novo projeto
+    bot.action('user_bounty_suggest', async (ctx) => {
+        try {
+            await ctx.answerCbQuery();
+            setUserState(ctx.from.id, { type: 'bounty_suggest_title' });
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('❌ Cancelar', 'user_bounties')]
+            ]);
+
+            await ctx.editMessageText(
+                '💡 *Sugerir Projeto*\n\n' +
+                'Tem uma ideia para melhorar a Atlas? Sugira!\n\n' +
+                '📝 Digite o *título* do seu projeto (máx. 40 caracteres):',
+                { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
+            );
+        } catch (error) {
+            logError('user_bounty_suggest', error, ctx);
+            await ctx.answerCbQuery('❌ Erro');
+        }
+    });
+
+    // ========================================
+    // BOUNTY HANDLERS PARA USUÁRIOS COMUNS
+    // ========================================
+
+    // Menu de contribuição - escolher método de pagamento
+    bot.action(/^bounty_contribute:(\d+)$/, async (ctx) => {
+        try {
+            const bountyId = parseInt(ctx.match[1]);
+            const bounty = await bountyService.getBountyById(bountyId);
+
+            if (!bounty || bounty.status !== 'approved') {
+                return ctx.answerCbQuery('❌ Projeto não disponível');
+            }
+
+            const escapeMarkdown = (text) => {
+                if (!text) return '';
+                return text.replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
+            };
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('💳 PIX', `bounty_vote_pix:${bountyId}`)],
+                [Markup.button.callback('🔗 DePix (Liquid)', `bounty_vote_liquid:${bountyId}:LIQUID_DEPIX`)],
+                [Markup.button.callback('₿ L-BTC', `bounty_vote_liquid:${bountyId}:LIQUID_LBTC`)],
+                [Markup.button.callback('💵 L-USDT', `bounty_vote_liquid:${bountyId}:LIQUID_USDT`)],
+                [Markup.button.callback('⬅️ Voltar', `user_bounty_view:${bountyId}`)]
+            ]);
+
+            await ctx.editMessageText(
+                `💰 *Contribuir para o Projeto*\n\n` +
+                `*${escapeMarkdown(bounty.title)}*\n\n` +
+                `Sua contribuição ajuda a financiar este projeto\\. Quando a meta for atingida, um trabalhador poderá executá\\-lo e receber a recompensa\\.\n\n` +
+                `Selecione o método de contribuição:`,
+                { parse_mode: 'MarkdownV2', reply_markup: keyboard.reply_markup }
+            );
+            await ctx.answerCbQuery();
+        } catch (error) {
+            logError('bounty_contribute', error, ctx);
+            await ctx.answerCbQuery('❌ Erro');
+        }
+    });
+
+    // Menu de trabalho - assumir o projeto
+    bot.action(/^bounty_work:(\d+)$/, async (ctx) => {
+        try {
+            const bountyId = parseInt(ctx.match[1]);
+            const bounty = await bountyService.getBountyById(bountyId);
+
+            if (!bounty || bounty.status !== 'approved') {
+                return ctx.answerCbQuery('❌ Projeto não disponível');
+            }
+
+            const escapeMarkdown = (text) => {
+                if (!text) return '';
+                return text.replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
+            };
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('✅ Assumir este Projeto', `bounty_claim:${bountyId}`)],
+                [Markup.button.callback('⬅️ Voltar', `user_bounty_view:${bountyId}`)]
+            ]);
+
+            await ctx.editMessageText(
+                `🛠️ *Trabalhar neste Projeto*\n\n` +
+                `*${escapeMarkdown(bounty.title)}*\n\n` +
+                `${escapeMarkdown(bounty.short_description)}\n\n` +
+                `💰 *Recompensa:* R\\$ ${parseFloat(bounty.total_brl || 0).toFixed(2).replace('.', '\\.')}\n\n` +
+                `Ao assumir este projeto, você se compromete a executá\\-lo\\. Um admin irá aprovar sua solicitação e você poderá começar a trabalhar\\.\n\n` +
+                `Ao concluir, envie o resultado e receba a recompensa\\!`,
+                { parse_mode: 'MarkdownV2', reply_markup: keyboard.reply_markup }
+            );
+            await ctx.answerCbQuery();
+        } catch (error) {
+            logError('bounty_work', error, ctx);
+            await ctx.answerCbQuery('❌ Erro');
+        }
+    });
+
+    // Assumir projeto (claim)
+    bot.action(/^bounty_claim:(\d+)$/, async (ctx) => {
+        try {
+            const bountyId = parseInt(ctx.match[1]);
+            await bountyService.claimBounty(bountyId, ctx.from.id, ctx.from.username);
+
+            await ctx.editMessageText(
+                `✅ *Solicitação Enviada\\!*\n\n` +
+                `Você solicitou assumir o projeto \\#${bountyId}\\.\n\n` +
+                `Um administrador irá analisar sua solicitação e você será notificado quando for aprovado\\.\n\n` +
+                `_Aguarde a aprovação para começar a trabalhar\\._`,
+                { parse_mode: 'MarkdownV2' }
+            );
+            await ctx.answerCbQuery('✅ Solicitação enviada!');
+        } catch (error) {
+            logError('bounty_claim', error, ctx);
+            await ctx.answerCbQuery(`❌ ${error.message}`);
+        }
+    });
+
+    // Contribuir com PIX - pedir valor
+    bot.action(/^bounty_vote_pix:(\d+)$/, async (ctx) => {
+        try {
+            const bountyId = parseInt(ctx.match[1]);
+
+            setUserState(ctx.from.id, {
+                type: 'bounty_vote_pix_amount',
+                bountyId: bountyId
+            });
+
+            await ctx.editMessageText(
+                `💳 *Contribuir com PIX*\n\n` +
+                `Digite o valor em R$ (mínimo R$ ${config.bounties.minPixAmountBrl}, máximo R$ ${config.bounties.maxPixAmountBrl}):\n\n` +
+                `_Exemplo: 50 ou 100.50_\n\n` +
+                `_Envie /cancel para cancelar_`,
+                { parse_mode: 'Markdown' }
+            );
+            await ctx.answerCbQuery();
+        } catch (error) {
+            logError('bounty_vote_pix', error, ctx);
+            await ctx.answerCbQuery('❌ Erro');
+        }
+    });
+
+    // Contribuir com Liquid - gerar endereço
+    bot.action(/^bounty_vote_liquid:(\d+):(.+)$/, async (ctx) => {
+        try {
+            const bountyId = parseInt(ctx.match[1]);
+            const assetType = ctx.match[2];
+
+            const { payment, address, assetId } = await bountyService.createLiquidPayment(
+                bountyId,
+                ctx.from.id,
+                ctx.from.username,
+                assetType
+            );
+
+            const assetName = assetType === 'LIQUID_LBTC' ? 'L-BTC' :
+                assetType === 'LIQUID_USDT' ? 'L-USDT' : 'DePix';
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('⬅️ Voltar', `bounty_contribute:${bountyId}`)]
+            ]);
+
+            await ctx.editMessageText(
+                `🔗 *Contribuição ${assetName}*\n\n` +
+                `Envie ${assetName} para o endereço abaixo:\n\n` +
+                `\`${address}\`\n\n` +
+                `✅ Detecção automática em ~30 segundos\n\n` +
+                `_Toque no endereço para copiar_`,
+                { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
+            );
+            await ctx.answerCbQuery();
+        } catch (error) {
+            logError('bounty_vote_liquid', error, ctx);
+            await ctx.answerCbQuery(`❌ ${error.message}`);
+        }
+    });
+
     bot.catch((err, ctx) => {
         logError('Global Telegraf bot.catch', err, ctx);
         if (err.message?.includes("query is too old") || err.message?.includes("message is not modified")) return;
         try { ctx.reply('Desculpe, ocorreu um erro inesperado. Por favor, tente /start novamente.'); }
         catch (replyError) { logError('Global bot.catch sendMessage fallback', replyError, ctx); }
     });
-    
+
     logger.info('Bot handlers registered.');
 };
 

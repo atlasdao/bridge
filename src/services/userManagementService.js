@@ -157,12 +157,12 @@ class UserManagementService {
         // Buscar transações recentes
         const transactionsResult = await this.dbPool.query(
             `SELECT
-                id,
-                pix_id,
-                status,
-                amount,
-                fee,
-                net_amount,
+                transaction_id as id,
+                depix_api_entry_id as pix_id,
+                payment_status as status,
+                requested_brl_amount as amount,
+                contribution_amount_brl as fee,
+                (requested_brl_amount - contribution_amount_brl) as net_amount,
                 created_at,
                 updated_at
             FROM pix_transactions
@@ -177,11 +177,11 @@ class UserManagementService {
             `SELECT
                 action,
                 reason,
-                admin_id,
-                created_at
+                performed_by as admin_id,
+                performed_at as created_at
             FROM ban_history
             WHERE telegram_user_id = $1
-            ORDER BY created_at DESC
+            ORDER BY performed_at DESC
             LIMIT 5`,
             [telegramUserId]
         );
@@ -192,10 +192,10 @@ class UserManagementService {
                 old_level,
                 new_level,
                 reason,
-                created_at
+                changed_at as created_at
             FROM reputation_level_history
             WHERE telegram_user_id = $1
-            ORDER BY created_at DESC
+            ORDER BY changed_at DESC
             LIMIT 5`,
             [telegramUserId]
         );

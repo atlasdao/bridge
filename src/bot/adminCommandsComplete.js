@@ -5,6 +5,9 @@ const BroadcastService = require('../services/broadcastService');
 const AuditService = require('../services/auditService');
 const UserManagementService = require('../services/userManagementService');
 const SystemManagementService = require('../services/systemManagementService');
+const WithdrawalService = require('../services/withdrawalService');
+const BountyService = require('../services/bountyService');
+const config = require('../core/config');
 
 // IDs dos admins autorizados
 const ADMIN_IDS = process.env.ADMIN_TELEGRAM_IDS ?
@@ -30,6 +33,7 @@ const registerAdminCommands = (bot, dbPool, redisClient) => {
     const auditService = new AuditService(dbPool);
     const userManagementService = new UserManagementService(dbPool, auditService);
     const systemManagementService = new SystemManagementService(dbPool, redisClient, bot);
+    const bountyService = new BountyService(dbPool, bot);
 
     // Estado das operações ativas
     const activeStates = new Map();
@@ -66,6 +70,10 @@ const registerAdminCommands = (bot, dbPool, redisClient) => {
             const keyboard = Markup.inlineKeyboard([
                 [Markup.button.callback('📢 Broadcast', 'adm_broadcast')],
                 [Markup.button.callback('👥 Usuários', 'adm_users')],
+                [Markup.button.callback('💰 Saques (DePix)', 'adm_withdrawals')],
+                [Markup.button.callback('💸 Fazer Saque (teste)', 'withdrawal_start')],
+                [Markup.button.callback('💝 Contribuições', 'adm_contributions')],
+                [Markup.button.callback('🎯 Projetos', 'adm_bounties')],
                 [Markup.button.callback('🔧 Sistema', 'adm_system')],
                 [Markup.button.callback('📊 Estatísticas', 'adm_stats')],
                 [Markup.button.callback('📜 Auditoria', 'adm_audit')]
@@ -452,6 +460,196 @@ const registerAdminCommands = (bot, dbPool, redisClient) => {
     });
 
     // ========================================
+    // MENU DE CONTRIBUIÇÕES
+    // ========================================
+    bot.action('adm_contributions', requireAdmin, async (ctx) => {
+        try {
+            // Buscar estatísticas de contribuições
+            const statsResult = await dbPool.query(`
+                SELECT
+                    COUNT(*) FILTER (WHERE contribution_fee > 0) as total_contributors,
+                    ROUND(AVG(contribution_fee) FILTER (WHERE contribution_fee > 0), 2) as avg_fee,
+                    MAX(contribution_fee) as max_fee,
+                    MIN(contribution_fee) FILTER (WHERE contribution_fee > 0) as min_fee
+                FROM users
+            `);
+            const stats = statsResult.rows[0];
+
+            // Distribuição por tier
+            const tierResult = await dbPool.query(`
+                SELECT
+                    contribution_fee,
+                    COUNT(*) as count
+                FROM users
+                WHERE contribution_fee > 0
+                GROUP BY contribution_fee
+                ORDER BY contribution_fee ASC
+            `);
+
+            // Total arrecadado
+            const collectedResult = await dbPool.query(`
+                SELECT
+                    COALESCE(SUM(contribution_amount_brl), 0) as total_collected,
+                    COUNT(*) as total_transactions
+                FROM pix_transactions
+                WHERE contribution_amount_brl > 0
+                AND payment_status IN ('CONFIRMED', 'PAID')
+            `);
+            const collected = collectedResult.rows[0];
+
+            // Taxa média efetiva (considera TODAS as transações a partir de 27/11/2025, incluindo as que não contribuem)
+            const effectiveFeeResult = await dbPool.query(`
+                SELECT
+                    COALESCE(ROUND(AVG(contribution_fee_percent), 2), 0) as avg_effective_fee
+                FROM pix_transactions
+                WHERE payment_status IN ('CONFIRMED', 'PAID')
+                AND created_at >= '2025-11-27'
+            `);
+            const effectiveFee = effectiveFeeResult.rows[0];
+
+            // Ranking da competição
+            const rankingResult = await dbPool.query(`
+                SELECT
+                    cr.telegram_user_id,
+                    u.telegram_username,
+                    cr.total_contribution_brl,
+                    cr.transaction_count
+                FROM contribution_ranking cr
+                JOIN users u ON u.telegram_user_id = cr.telegram_user_id
+                WHERE cr.competition_id = '2024-11-26_2024-12-26'
+                ORDER BY cr.total_contribution_brl DESC
+                LIMIT 5
+            `);
+
+            let message = `<b>💝 Contribuições</b>\n\n`;
+            message += `<b>📊 Resumo Geral:</b>\n`;
+            message += `├ Contribuidores ativos: ${stats.total_contributors || 0}\n`;
+            message += `├ Taxa média: ${stats.avg_fee || 0}%\n`;
+            message += `├ Taxa média efetiva: ${effectiveFee.avg_effective_fee || 0}%\n`;
+            message += `├ Taxa máxima: ${stats.max_fee || 0}%\n`;
+            message += `└ Taxa mínima: ${stats.min_fee || 0}%\n\n`;
+
+            message += `<b>💰 Arrecadação:</b>\n`;
+            message += `├ Total: R$ ${parseFloat(collected.total_collected || 0).toFixed(2)}\n`;
+            message += `└ Transações: ${collected.total_transactions || 0}\n\n`;
+
+            if (tierResult.rows.length > 0) {
+                message += `<b>📈 Distribuição por Taxa:</b>\n`;
+                for (const tier of tierResult.rows) {
+                    message += `├ ${tier.contribution_fee}%: ${tier.count} usuário(s)\n`;
+                }
+                message += `\n`;
+            }
+
+            if (rankingResult.rows.length > 0) {
+                message += `<b>🏆 Top 5 Competição (26/11-26/12):</b>\n`;
+                let pos = 1;
+                for (const r of rankingResult.rows) {
+                    const medal = pos === 1 ? '🥇' : pos === 2 ? '🥈' : pos === 3 ? '🥉' : `${pos}.`;
+                    const username = r.telegram_username ? `@${r.telegram_username}` : `ID: ${r.telegram_user_id}`;
+                    message += `${medal} ${username}: R$ ${parseFloat(r.total_contribution_brl).toFixed(2)} (${r.transaction_count} tx)\n`;
+                    pos++;
+                }
+            } else {
+                message += `<b>🏆 Top 5 Competição (26/11-26/12):</b>\n`;
+                message += `<i>Nenhuma contribuição registrada ainda</i>\n`;
+            }
+
+            // Adicionar timestamp para forçar atualização
+            const now = new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+            message += `\n<i>Atualizado às ${now}</i>`;
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('👥 Ver Todos', 'contrib_list_0')],
+                [Markup.button.callback('🔄 Atualizar', 'adm_contributions')],
+                [Markup.button.callback('◀️ Voltar', 'adm_main')]
+            ]);
+
+            await ctx.editMessageText(message, {
+                parse_mode: 'HTML',
+                reply_markup: keyboard.reply_markup
+            });
+            await ctx.answerCbQuery();
+        } catch (error) {
+            logger.error(`[Admin Contributions] Erro: ${error.message}`);
+            await ctx.answerCbQuery('❌ Erro ao carregar contribuições');
+        }
+    });
+
+    // Lista de contribuidores com paginação
+    bot.action(/contrib_list_(\d+)/, requireAdmin, async (ctx) => {
+        try {
+            const page = parseInt(ctx.match[1]);
+            const limit = 10;
+            const offset = page * limit;
+
+            // Contar total
+            const countResult = await dbPool.query(`
+                SELECT COUNT(*) as total FROM users WHERE contribution_fee > 0
+            `);
+            const total = parseInt(countResult.rows[0].total);
+            const totalPages = Math.ceil(total / limit);
+
+            // Buscar página atual
+            const result = await dbPool.query(`
+                SELECT
+                    u.telegram_user_id,
+                    u.telegram_username,
+                    u.contribution_fee,
+                    u.total_volume_brl,
+                    COALESCE(SUM(pt.contribution_amount_brl), 0) as total_contributed
+                FROM users u
+                LEFT JOIN pix_transactions pt ON pt.user_id = u.telegram_user_id
+                    AND pt.contribution_amount_brl > 0
+                    AND pt.payment_status IN ('CONFIRMED', 'PAID')
+                WHERE u.contribution_fee > 0
+                GROUP BY u.telegram_user_id, u.telegram_username, u.contribution_fee, u.total_volume_brl
+                ORDER BY u.contribution_fee DESC, total_contributed DESC
+                LIMIT $1 OFFSET $2
+            `, [limit, offset]);
+
+            let message = `<b>👥 Lista de Contribuidores</b>\n`;
+            message += `<i>Página ${page + 1}/${totalPages || 1} (${total} total)</i>\n\n`;
+
+            if (result.rows.length === 0) {
+                message += `<i>Nenhum contribuidor ativo</i>`;
+            } else {
+                let idx = offset + 1;
+                for (const user of result.rows) {
+                    const username = user.telegram_username ? `@${user.telegram_username}` : `ID: ${user.telegram_user_id}`;
+                    message += `<b>${idx}.</b> ${username}\n`;
+                    message += `   Taxa: ${user.contribution_fee}% | Contrib: R$ ${parseFloat(user.total_contributed).toFixed(2)}\n`;
+                    message += `   Volume: R$ ${parseFloat(user.total_volume_brl || 0).toFixed(2)}\n\n`;
+                    idx++;
+                }
+            }
+
+            // Botões de navegação
+            const navButtons = [];
+            if (page > 0) {
+                navButtons.push(Markup.button.callback('⬅️ Anterior', `contrib_list_${page - 1}`));
+            }
+            if (page < totalPages - 1) {
+                navButtons.push(Markup.button.callback('Próxima ➡️', `contrib_list_${page + 1}`));
+            }
+
+            const keyboard = Markup.inlineKeyboard([
+                navButtons.length > 0 ? navButtons : [],
+                [Markup.button.callback('◀️ Voltar', 'adm_contributions')]
+            ].filter(row => row.length > 0));
+
+            await ctx.editMessageText(message, {
+                parse_mode: 'HTML',
+                reply_markup: keyboard.reply_markup
+            });
+            await ctx.answerCbQuery();
+        } catch (error) {
+            logger.error(`[Contrib List] Erro: ${error.message}`);
+            await ctx.answerCbQuery('❌ Erro ao carregar lista');
+        }
+    });
+
+    // ========================================
     // MENU DE AUDITORIA
     // ========================================
     bot.action('adm_audit', requireAdmin, async (ctx) => {
@@ -529,6 +727,10 @@ const registerAdminCommands = (bot, dbPool, redisClient) => {
             const keyboard = Markup.inlineKeyboard([
                 [Markup.button.callback('📢 Broadcast', 'adm_broadcast')],
                 [Markup.button.callback('👥 Usuários', 'adm_users')],
+                [Markup.button.callback('💰 Saques (DePix)', 'adm_withdrawals')],
+                [Markup.button.callback('💸 Fazer Saque (teste)', 'withdrawal_start')],
+                [Markup.button.callback('💝 Contribuições', 'adm_contributions')],
+                [Markup.button.callback('🎯 Projetos', 'adm_bounties')],
                 [Markup.button.callback('🔧 Sistema', 'adm_system')],
                 [Markup.button.callback('📊 Estatísticas', 'adm_stats')],
                 [Markup.button.callback('📜 Auditoria', 'adm_audit')]
@@ -593,6 +795,18 @@ const registerAdminCommands = (bot, dbPool, redisClient) => {
 
                 case 'edit_post_purchase_message':
                     await handlePostPurchaseMessage(ctx, state);
+                    break;
+
+                case 'bounty_create_title':
+                    await handleBountyCreateTitle(ctx, state);
+                    break;
+
+                case 'bounty_create_desc':
+                    await handleBountyCreateDesc(ctx, state);
+                    break;
+
+                case 'bounty_vote_pix_amount':
+                    await handleBountyVotePixAmount(ctx, state);
                     break;
 
                 default:
@@ -810,6 +1024,7 @@ const registerAdminCommands = (bot, dbPool, redisClient) => {
             let message = `👤 Detalhes do Usuário\n\n`;
             message += `Informações Básicas:\n`;
             message += `├ ID: ${user.telegram_user_id}\n`;
+            message += `├ EUID: ${user.euid || 'N/A'}\n`;
             message += `├ Username: @${user.telegram_username || 'N/A'}\n`;
             message += `├ Nome: ${user.telegram_full_name || 'N/A'}\n`;
             message += `├ CPF/CNPJ: ${user.payer_cpf_cnpj || 'N/A'}\n`;
@@ -2763,6 +2978,1189 @@ const registerAdminCommands = (bot, dbPool, redisClient) => {
             await ctx.answerCbQuery('❌ Erro');
         }
     });
+
+    // ========================================
+    // MENU DE SAQUES (DePix → PIX)
+    // ========================================
+
+    // Inicializar serviço de saques
+    const withdrawalService = new WithdrawalService(dbPool, bot);
+
+    // Menu principal de saques
+    bot.action('adm_withdrawals', requireAdmin, async (ctx) => {
+        try {
+            const statsToday = await withdrawalService.getStatsToday();
+            const statsMonth = await withdrawalService.getStatsMonth();
+            const pending = await withdrawalService.getPendingForProcessing();
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('📊 Dashboard Detalhado', 'wd_dashboard')],
+                [Markup.button.callback(`🔔 Prontos (${pending.length})`, 'wd_ready')],
+                [Markup.button.callback('⏳ Aguardando Pagamento', 'wd_awaiting')],
+                [Markup.button.callback('✅ Histórico Processados', 'wd_history')],
+                [Markup.button.callback('◀️ Voltar', 'adm_main')]
+            ]);
+
+            // Calcular lucro (2.5% - 1% Eulen = 1.5% + taxa de rede)
+            const profitToday = parseFloat(statsToday.total_profit || 0);
+            const profitMonth = parseFloat(statsMonth.total_profit || 0);
+
+            await ctx.editMessageText(
+                `💰 *Saques DePix → PIX*\n\n` +
+                `📊 *Resumo Hoje:*\n` +
+                `├ Processados: ${statsToday.completed_count || 0}\n` +
+                `├ Volume: R$ ${parseFloat(statsToday.total_volume || 0).toFixed(2)}\n` +
+                `├ Taxas: R$ ${parseFloat(statsToday.total_fees || 0).toFixed(2)}\n` +
+                `└ Lucro: R$ ${profitToday.toFixed(2)}\n\n` +
+                `📅 *Resumo Mês:*\n` +
+                `├ Processados: ${statsMonth.completed_count || 0}\n` +
+                `├ Volume: R$ ${parseFloat(statsMonth.total_volume || 0).toFixed(2)}\n` +
+                `├ Taxas: R$ ${parseFloat(statsMonth.total_fees || 0).toFixed(2)}\n` +
+                `└ Lucro: R$ ${profitMonth.toFixed(2)}\n\n` +
+                `🔔 *Aguardando Ação:* ${pending.length} saques prontos\n\n` +
+                `Selecione uma opção:`,
+                {
+                    parse_mode: 'Markdown',
+                    reply_markup: keyboard.reply_markup
+                }
+            );
+            await ctx.answerCbQuery();
+        } catch (error) {
+            logger.error(`[Admin Withdrawals] Erro: ${error.message}`);
+            await ctx.answerCbQuery('❌ Erro ao carregar menu de saques');
+        }
+    });
+
+    // Dashboard detalhado
+    bot.action('wd_dashboard', requireAdmin, async (ctx) => {
+        try {
+            const statsToday = await withdrawalService.getStatsToday();
+            const statsMonth = await withdrawalService.getStatsMonth();
+
+            // Buscar estatísticas adicionais
+            const additionalStats = await dbPool.query(`
+                SELECT
+                    COUNT(*) FILTER (WHERE status = 'AWAITING_PAYMENT') as awaiting_count,
+                    COUNT(*) FILTER (WHERE status = 'PAYMENT_DETECTED') as detected_count,
+                    COUNT(*) FILTER (WHERE status = 'PROCESSING') as processing_count,
+                    COUNT(*) FILTER (WHERE status = 'COMPLETED') as completed_count,
+                    COUNT(*) FILTER (WHERE status = 'EXPIRED') as expired_count,
+                    COUNT(*) FILTER (WHERE status = 'CANCELLED') as cancelled_count,
+                    COUNT(DISTINCT telegram_user_id) FILTER (WHERE status = 'COMPLETED') as unique_users,
+                    AVG(requested_pix_amount) FILTER (WHERE status = 'COMPLETED') as avg_amount
+                FROM withdrawal_transactions
+                WHERE created_at >= DATE_TRUNC('month', CURRENT_DATE)
+            `);
+            const stats = additionalStats.rows[0];
+
+            // Lucro detalhado
+            // Receita = taxa 2.5% + taxa de rede
+            // Custo = 1% Eulen + taxa de rede real
+            // Lucro = 1.5% do valor + diferença de taxas de rede
+            const revenueToday = parseFloat(statsToday.total_fees || 0);
+            const eulenCostToday = parseFloat(statsToday.total_volume || 0) * 0.01;
+            const networkCostToday = parseFloat(statsToday.total_network_fees || 0) * 0.7; // Estimativa custo real
+            const profitToday = revenueToday - eulenCostToday - networkCostToday;
+
+            const revenueMonth = parseFloat(statsMonth.total_fees || 0);
+            const eulenCostMonth = parseFloat(statsMonth.total_volume || 0) * 0.01;
+            const networkCostMonth = parseFloat(statsMonth.total_network_fees || 0) * 0.7;
+            const profitMonth = revenueMonth - eulenCostMonth - networkCostMonth;
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('🔄 Atualizar', 'wd_dashboard')],
+                [Markup.button.callback('◀️ Voltar', 'adm_withdrawals')]
+            ]);
+
+            await ctx.editMessageText(
+                `📊 *Dashboard de Saques*\n\n` +
+                `💵 *Hoje:*\n` +
+                `├ Processados: ${statsToday.completed_count || 0}\n` +
+                `├ Volume PIX: R$ ${parseFloat(statsToday.total_volume || 0).toFixed(2)}\n` +
+                `├ Taxa 2.5%: R$ ${parseFloat(statsToday.total_our_fees || 0).toFixed(2)}\n` +
+                `├ Taxa Rede: R$ ${parseFloat(statsToday.total_network_fees || 0).toFixed(2)}\n` +
+                `├ Receita Total: R$ ${revenueToday.toFixed(2)}\n` +
+                `├ Custo Eulen (1%): R$ ${eulenCostToday.toFixed(2)}\n` +
+                `└ *Lucro Líquido:* R$ ${profitToday.toFixed(2)}\n\n` +
+                `📅 *Este Mês:*\n` +
+                `├ Processados: ${statsMonth.completed_count || 0}\n` +
+                `├ Volume PIX: R$ ${parseFloat(statsMonth.total_volume || 0).toFixed(2)}\n` +
+                `├ Taxa 2.5%: R$ ${parseFloat(statsMonth.total_our_fees || 0).toFixed(2)}\n` +
+                `├ Taxa Rede: R$ ${parseFloat(statsMonth.total_network_fees || 0).toFixed(2)}\n` +
+                `├ Receita Total: R$ ${revenueMonth.toFixed(2)}\n` +
+                `├ Custo Eulen (1%): R$ ${eulenCostMonth.toFixed(2)}\n` +
+                `└ *Lucro Líquido:* R$ ${profitMonth.toFixed(2)}\n\n` +
+                `📈 *Status do Mês:*\n` +
+                `├ Aguardando: ${stats.awaiting_count || 0}\n` +
+                `├ Detectados: ${stats.detected_count || 0}\n` +
+                `├ Processando: ${stats.processing_count || 0}\n` +
+                `├ Completados: ${stats.completed_count || 0}\n` +
+                `├ Expirados: ${stats.expired_count || 0}\n` +
+                `├ Cancelados: ${stats.cancelled_count || 0}\n` +
+                `├ Usuários únicos: ${stats.unique_users || 0}\n` +
+                `└ Ticket médio: R$ ${parseFloat(stats.avg_amount || 0).toFixed(2)}`,
+                {
+                    parse_mode: 'Markdown',
+                    reply_markup: keyboard.reply_markup
+                }
+            );
+            await ctx.answerCbQuery();
+        } catch (error) {
+            logger.error(`[Withdrawal Dashboard] Erro: ${error.message}`);
+            await ctx.answerCbQuery('❌ Erro ao carregar dashboard');
+        }
+    });
+
+    // Lista de saques prontos para processar
+    bot.action('wd_ready', requireAdmin, async (ctx) => {
+        try {
+            const pending = await withdrawalService.getPendingForProcessing();
+
+            if (pending.length === 0) {
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('🔄 Atualizar', 'wd_ready')],
+                    [Markup.button.callback('◀️ Voltar', 'adm_withdrawals')]
+                ]);
+
+                await ctx.editMessageText(
+                    `🔔 *Saques Prontos para Processar*\n\n` +
+                    `✅ Nenhum saque pendente no momento!\n\n` +
+                    `Quando um usuário enviar DePix, o saque aparecerá aqui automaticamente.`,
+                    {
+                        parse_mode: 'Markdown',
+                        reply_markup: keyboard.reply_markup
+                    }
+                );
+                await ctx.answerCbQuery();
+                return;
+            }
+
+            let message = `🔔 *Saques Prontos (${pending.length})*\n\n`;
+            const buttons = [];
+
+            for (const wd of pending.slice(0, 10)) {
+                const createdAt = new Date(wd.created_at).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+                message += `💵 *R$ ${parseFloat(wd.requested_pix_amount).toFixed(2)}*\n`;
+                message += `├ ID: \`${wd.withdrawal_id.substring(0, 8)}...\`\n`;
+                message += `├ PIX: ${wd.pix_key_type}\n`;
+                message += `├ Usuário: ${wd.telegram_user_id}\n`;
+                message += `└ ${createdAt}\n\n`;
+
+                buttons.push([
+                    Markup.button.callback(
+                        `💵 R$ ${parseFloat(wd.requested_pix_amount).toFixed(2)} - Ver`,
+                        `wd_view:${wd.withdrawal_id}`
+                    )
+                ]);
+            }
+
+            if (pending.length > 10) {
+                message += `\n_...e mais ${pending.length - 10} saques_`;
+            }
+
+            buttons.push([Markup.button.callback('🔄 Atualizar', 'wd_ready')]);
+            buttons.push([Markup.button.callback('◀️ Voltar', 'adm_withdrawals')]);
+
+            await ctx.editMessageText(message, {
+                parse_mode: 'Markdown',
+                reply_markup: Markup.inlineKeyboard(buttons).reply_markup
+            });
+            await ctx.answerCbQuery();
+        } catch (error) {
+            logger.error(`[Withdrawal Ready] Erro: ${error.message}`);
+            await ctx.answerCbQuery('❌ Erro ao carregar saques');
+        }
+    });
+
+    // Lista de saques aguardando pagamento
+    bot.action('wd_awaiting', requireAdmin, async (ctx) => {
+        try {
+            const result = await dbPool.query(`
+                SELECT w.*, u.telegram_username
+                FROM withdrawal_transactions w
+                LEFT JOIN users u ON w.telegram_user_id = u.telegram_user_id
+                WHERE w.status = 'AWAITING_PAYMENT'
+                ORDER BY w.created_at DESC
+                LIMIT 20
+            `);
+
+            if (result.rows.length === 0) {
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('🔄 Atualizar', 'wd_awaiting')],
+                    [Markup.button.callback('◀️ Voltar', 'adm_withdrawals')]
+                ]);
+
+                await ctx.editMessageText(
+                    `⏳ *Aguardando Pagamento*\n\n` +
+                    `Nenhum saque aguardando depósito DePix.`,
+                    {
+                        parse_mode: 'Markdown',
+                        reply_markup: keyboard.reply_markup
+                    }
+                );
+                await ctx.answerCbQuery();
+                return;
+            }
+
+            let message = `⏳ *Aguardando Pagamento (${result.rows.length})*\n\n`;
+
+            for (const wd of result.rows.slice(0, 10)) {
+                const createdAt = new Date(wd.created_at).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+                const expiresAt = new Date(wd.expires_at);
+                const now = new Date();
+                const minutesLeft = Math.max(0, Math.floor((expiresAt - now) / 60000));
+
+                message += `💵 R$ ${parseFloat(wd.requested_pix_amount).toFixed(2)}\n`;
+                message += `├ @${wd.telegram_username || wd.telegram_user_id}\n`;
+                message += `├ DePix: ${parseFloat(wd.total_depix_required).toFixed(2)}\n`;
+                message += `├ Expira em: ${minutesLeft} min\n`;
+                message += `└ ${createdAt}\n\n`;
+            }
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('🔄 Atualizar', 'wd_awaiting')],
+                [Markup.button.callback('◀️ Voltar', 'adm_withdrawals')]
+            ]);
+
+            await ctx.editMessageText(message, {
+                parse_mode: 'Markdown',
+                reply_markup: keyboard.reply_markup
+            });
+            await ctx.answerCbQuery();
+        } catch (error) {
+            logger.error(`[Withdrawal Awaiting] Erro: ${error.message}`);
+            await ctx.answerCbQuery('❌ Erro ao carregar saques');
+        }
+    });
+
+    // Histórico de saques processados
+    bot.action(/wd_history(?:_(\d+))?/, requireAdmin, async (ctx) => {
+        try {
+            const page = parseInt(ctx.match[1] || '0');
+            const limit = 10;
+            const offset = page * limit;
+
+            const result = await dbPool.query(`
+                SELECT w.*, u.telegram_username,
+                    (SELECT COUNT(*) FROM withdrawal_transactions WHERE status = 'COMPLETED') as total_count
+                FROM withdrawal_transactions w
+                LEFT JOIN users u ON w.telegram_user_id = u.telegram_user_id
+                WHERE w.status = 'COMPLETED'
+                ORDER BY w.actual_completion_at DESC
+                LIMIT $1 OFFSET $2
+            `, [limit, offset]);
+
+            if (result.rows.length === 0 && page === 0) {
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('◀️ Voltar', 'adm_withdrawals')]
+                ]);
+
+                await ctx.editMessageText(
+                    `✅ *Histórico de Saques*\n\n` +
+                    `Nenhum saque processado ainda.`,
+                    {
+                        parse_mode: 'Markdown',
+                        reply_markup: keyboard.reply_markup
+                    }
+                );
+                await ctx.answerCbQuery();
+                return;
+            }
+
+            const totalCount = parseInt(result.rows[0]?.total_count || 0);
+            const totalPages = Math.ceil(totalCount / limit);
+
+            let message = `✅ *Histórico de Saques (Página ${page + 1}/${totalPages || 1})*\n\n`;
+
+            for (const wd of result.rows) {
+                const completedAt = new Date(wd.actual_completion_at).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+                message += `💵 R$ ${parseFloat(wd.requested_pix_amount).toFixed(2)}\n`;
+                message += `├ @${wd.telegram_username || wd.telegram_user_id}\n`;
+                message += `├ PIX: ${wd.pix_key_type}\n`;
+                message += `└ ${completedAt}\n\n`;
+            }
+
+            const buttons = [];
+            const navButtons = [];
+
+            if (page > 0) {
+                navButtons.push(Markup.button.callback('⬅️', `wd_history_${page - 1}`));
+            }
+            navButtons.push(Markup.button.callback(`${page + 1}/${totalPages || 1}`, 'noop'));
+            if (page < totalPages - 1) {
+                navButtons.push(Markup.button.callback('➡️', `wd_history_${page + 1}`));
+            }
+
+            if (navButtons.length > 1) {
+                buttons.push(navButtons);
+            }
+            buttons.push([Markup.button.callback('◀️ Voltar', 'adm_withdrawals')]);
+
+            await ctx.editMessageText(message, {
+                parse_mode: 'Markdown',
+                reply_markup: Markup.inlineKeyboard(buttons).reply_markup
+            });
+            await ctx.answerCbQuery();
+        } catch (error) {
+            logger.error(`[Withdrawal History] Erro: ${error.message}`);
+            await ctx.answerCbQuery('❌ Erro ao carregar histórico');
+        }
+    });
+
+    // Ver detalhes de um saque específico
+    bot.action(/wd_view:(.+)/, requireAdmin, async (ctx) => {
+        try {
+            const withdrawalId = ctx.match[1];
+
+            const result = await dbPool.query(`
+                SELECT w.*, u.telegram_username, u.telegram_full_name
+                FROM withdrawal_transactions w
+                LEFT JOIN users u ON w.telegram_user_id = u.telegram_user_id
+                WHERE w.withdrawal_id = $1
+            `, [withdrawalId]);
+
+            if (result.rows.length === 0) {
+                await ctx.answerCbQuery('❌ Saque não encontrado');
+                return;
+            }
+
+            const wd = result.rows[0];
+            const createdAt = new Date(wd.created_at).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+            const detectedAt = wd.liquid_payment_detected_at ?
+                new Date(wd.liquid_payment_detected_at).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' }) : 'N/A';
+
+            // Formatar chave PIX para exibição
+            let pixKeyDisplay = wd.pix_key_value;
+            if (wd.pix_key_type === 'CPF') {
+                pixKeyDisplay = wd.pix_key_value; // Já está formatado
+            }
+
+            // Comando para Eulen
+            const eulenCommand = `/withdraw ${parseFloat(wd.requested_pix_amount).toFixed(2)} ${wd.pix_key_value}`;
+
+            let message = `💰 *Detalhes do Saque*\n\n`;
+            message += `📋 *ID:* \`${wd.withdrawal_id}\`\n`;
+            message += `📊 *Status:* ${getStatusEmoji(wd.status)} ${wd.status}\n\n`;
+            message += `👤 *Usuário:*\n`;
+            message += `├ ID: ${wd.telegram_user_id}\n`;
+            message += `├ Username: @${wd.telegram_username || 'N/A'}\n`;
+            message += `└ Nome: ${wd.telegram_full_name || 'N/A'}\n\n`;
+            message += `💵 *Valores:*\n`;
+            message += `├ PIX Solicitado: R$ ${parseFloat(wd.requested_pix_amount).toFixed(2)}\n`;
+            message += `├ Taxa (2.5%): R$ ${parseFloat(wd.our_fee_amount).toFixed(2)}\n`;
+            message += `├ Taxa Rede: R$ ${parseFloat(wd.network_fee_amount).toFixed(2)}\n`;
+            message += `└ Total DePix: ${parseFloat(wd.total_depix_required).toFixed(2)}\n\n`;
+            message += `🔑 *Chave PIX:*\n`;
+            message += `├ Tipo: ${wd.pix_key_type}\n`;
+            message += `└ Valor: \`${pixKeyDisplay}\`\n\n`;
+            message += `📍 *Endereço Liquid:*\n`;
+            message += `\`${wd.deposit_address}\`\n\n`;
+
+            if (wd.liquid_txid) {
+                message += `🔗 *TX Liquid:*\n`;
+                message += `\`${wd.liquid_txid}\`\n\n`;
+            }
+
+            message += `📅 *Datas:*\n`;
+            message += `├ Criado: ${createdAt}\n`;
+            message += `└ Detectado: ${detectedAt}\n\n`;
+
+            if (wd.status === 'PAYMENT_DETECTED') {
+                message += `📋 *Comando Eulen:*\n`;
+                message += `\`${eulenCommand}\``;
+            }
+
+            const buttons = [];
+
+            if (wd.status === 'PAYMENT_DETECTED') {
+                buttons.push([
+                    Markup.button.callback('📋 Copiar Comando', `wd_copy:${wd.withdrawal_id}`),
+                    Markup.button.callback('✅ Marcar Processado', `wd_complete:${wd.withdrawal_id}`)
+                ]);
+            }
+
+            buttons.push([Markup.button.callback('◀️ Voltar', 'wd_ready')]);
+
+            await ctx.editMessageText(message, {
+                parse_mode: 'Markdown',
+                reply_markup: Markup.inlineKeyboard(buttons).reply_markup
+            });
+            await ctx.answerCbQuery();
+        } catch (error) {
+            logger.error(`[Withdrawal View] Erro: ${error.message}`);
+            await ctx.answerCbQuery('❌ Erro ao carregar detalhes');
+        }
+    });
+
+    // Copiar comando Eulen (envia como mensagem para fácil cópia)
+    bot.action(/wd_copy:(.+)/, requireAdmin, async (ctx) => {
+        try {
+            const withdrawalId = ctx.match[1];
+
+            const result = await dbPool.query(`
+                SELECT requested_pix_amount, pix_key_value
+                FROM withdrawal_transactions
+                WHERE withdrawal_id = $1
+            `, [withdrawalId]);
+
+            if (result.rows.length === 0) {
+                await ctx.answerCbQuery('❌ Saque não encontrado');
+                return;
+            }
+
+            const wd = result.rows[0];
+            const eulenCommand = `/withdraw ${parseFloat(wd.requested_pix_amount).toFixed(2)} ${wd.pix_key_value}`;
+
+            // Enviar comando como mensagem separada para fácil cópia
+            await ctx.reply(
+                `📋 Comando para Eulen:\n\n\`${eulenCommand}\``,
+                { parse_mode: 'Markdown' }
+            );
+
+            await ctx.answerCbQuery('📋 Comando enviado!');
+        } catch (error) {
+            logger.error(`[Withdrawal Copy] Erro: ${error.message}`);
+            await ctx.answerCbQuery('❌ Erro');
+        }
+    });
+
+    // Marcar saque como processado
+    bot.action(/wd_complete:(.+)/, requireAdmin, async (ctx) => {
+        try {
+            const withdrawalId = ctx.match[1];
+            const adminId = ctx.from.id;
+
+            await withdrawalService.markAsProcessed(withdrawalId, adminId);
+
+            // Registrar ação de auditoria
+            await auditService.logAdminAction({
+                adminId: adminId,
+                adminUsername: ctx.from.username,
+                actionType: 'WITHDRAWAL_PROCESSED',
+                actionDescription: `Saque ${withdrawalId} marcado como processado`
+            });
+
+            await ctx.answerCbQuery('✅ Saque marcado como processado!');
+
+            // Atualizar a view para mostrar próximo ou voltar à lista
+            const pending = await withdrawalService.getPendingForProcessing();
+
+            if (pending.length > 0) {
+                // Mostrar próximo saque
+                ctx.match = [`wd_view:${pending[0].withdrawal_id}`, pending[0].withdrawal_id];
+
+                // Recarregar a lista
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback(`Ver próximo (${pending.length} restantes)`, `wd_view:${pending[0].withdrawal_id}`)],
+                    [Markup.button.callback('◀️ Voltar à lista', 'wd_ready')]
+                ]);
+
+                await ctx.editMessageText(
+                    `✅ *Saque Processado!*\n\n` +
+                    `O saque foi marcado como concluído.\n\n` +
+                    `📊 Restam ${pending.length} saques para processar.`,
+                    {
+                        parse_mode: 'Markdown',
+                        reply_markup: keyboard.reply_markup
+                    }
+                );
+            } else {
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('◀️ Voltar', 'adm_withdrawals')]
+                ]);
+
+                await ctx.editMessageText(
+                    `✅ *Saque Processado!*\n\n` +
+                    `O saque foi marcado como concluído.\n\n` +
+                    `🎉 Todos os saques foram processados!`,
+                    {
+                        parse_mode: 'Markdown',
+                        reply_markup: keyboard.reply_markup
+                    }
+                );
+            }
+        } catch (error) {
+            logger.error(`[Withdrawal Complete] Erro: ${error.message}`);
+            await ctx.answerCbQuery('❌ Erro ao processar');
+        }
+    });
+
+    // Helper para emoji de status
+    function getStatusEmoji(status) {
+        const emojis = {
+            'AWAITING_PAYMENT': '⏳',
+            'PAYMENT_DETECTED': '🔔',
+            'PROCESSING': '⚙️',
+            'COMPLETED': '✅',
+            'EXPIRED': '⌛',
+            'CANCELLED': '❌',
+            'FAILED': '💥'
+        };
+        return emojis[status] || '❓';
+    }
+
+    // ========================================
+    // MENU DE BOUNTIES
+    // ========================================
+    bot.action('adm_bounties', requireAdmin, async (ctx) => {
+        try {
+            const stats = await bountyService.getBountyStats();
+            const pendingCount = stats.pending_review?.count || 0;
+            const approvedCount = stats.approved?.count || 0;
+            const takenCount = stats.taken?.count || 0;
+            const inDevCount = stats.in_development?.count || 0;
+            const completedCount = stats.completed?.count || 0;
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback(`📋 Pendentes (${pendingCount})`, 'bounty_pending')],
+                [Markup.button.callback(`✅ Aprovados (${approvedCount})`, 'bounty_approved')],
+                [Markup.button.callback(`👷 Claims Pendentes (${takenCount})`, 'bounty_taken')],
+                [Markup.button.callback(`🔨 Em Desenvolvimento (${inDevCount})`, 'bounty_in_dev')],
+                [Markup.button.callback(`💰 Completados (${completedCount})`, 'bounty_completed')],
+                [Markup.button.callback('📊 Estatísticas', 'bounty_stats')],
+                [Markup.button.callback('➕ Criar Projeto', 'bounty_create')],
+                [Markup.button.callback('◀️ Voltar', 'adm_main')]
+            ]);
+
+            const totalBrl = Object.values(stats).reduce((sum, s) => sum + (s.total_brl || 0), 0);
+            const totalVotes = Object.values(stats).reduce((sum, s) => sum + (s.vote_count || 0), 0);
+
+            await ctx.editMessageText(
+                `🎯 *Projetos & Recompensas*\n\n` +
+                `A Atlas é sustentada por contribuições. Aqui você pode apoiar projetos específicos ou assumir trabalhos e ser remunerado por isso.\n\n` +
+                `💰 *Contribuir* — Financie projetos que você quer ver prontos\n` +
+                `🛠️ *Trabalhar* — Execute projetos e receba a recompensa\n\n` +
+                `📊 ${approvedCount} abertos · ${inDevCount} em andamento · R$ ${totalBrl.toFixed(2)} arrecadados`,
+                {
+                    parse_mode: 'Markdown',
+                    reply_markup: keyboard.reply_markup
+                }
+            );
+            await ctx.answerCbQuery();
+        } catch (error) {
+            logger.error(`[Admin Bounties] Erro: ${error.message}`);
+            await ctx.answerCbQuery('❌ Erro ao carregar menu de bounties');
+        }
+    });
+
+    // Listar bounties pendentes de aprovação
+    bot.action('bounty_pending', requireAdmin, async (ctx) => {
+        try {
+            const bounties = await bountyService.listBounties('pending_review', 10);
+
+            if (bounties.length === 0) {
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('◀️ Voltar', 'adm_bounties')]
+                ]);
+                await ctx.editMessageText(
+                    '📋 *Projetos Pendentes*\n\n' +
+                    '✅ Nenhum projeto pendente de aprovação.',
+                    { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
+                );
+                return ctx.answerCbQuery();
+            }
+
+            const buttons = bounties.map(b => [
+                Markup.button.callback(`📝 ${b.title.substring(0, 30)}...`, `bounty_review:${b.id}`)
+            ]);
+            buttons.push([Markup.button.callback('◀️ Voltar', 'adm_bounties')]);
+
+            await ctx.editMessageText(
+                `📋 *Projetos Pendentes (${bounties.length})*\n\n` +
+                `Clique em um projeto para revisar:`,
+                { parse_mode: 'Markdown', reply_markup: Markup.inlineKeyboard(buttons).reply_markup }
+            );
+            await ctx.answerCbQuery();
+        } catch (error) {
+            logger.error(`[Bounty Pending] Erro: ${error.message}`);
+            await ctx.answerCbQuery('❌ Erro');
+        }
+    });
+
+    // Revisar bounty específico
+    bot.action(/^bounty_review:(\d+)$/, requireAdmin, async (ctx) => {
+        try {
+            const bountyId = parseInt(ctx.match[1]);
+            const bounty = await bountyService.getBountyById(bountyId);
+
+            if (!bounty) {
+                return ctx.answerCbQuery('❌ Bounty não encontrado');
+            }
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('✅ Aprovar', `bounty_approve:${bountyId}`)],
+                [Markup.button.callback('❌ Rejeitar', `bounty_reject:${bountyId}`)],
+                [Markup.button.callback('◀️ Voltar', 'bounty_pending')]
+            ]);
+
+            const createdAt = new Date(bounty.created_at).toLocaleString('pt-BR');
+
+            const creatorDisplay = bounty.creator_username
+                ? `@${escapeMarkdownV2(bounty.creator_username)}`
+                : bounty.creator_telegram_id;
+
+            await ctx.editMessageText(
+                `📝 *Revisar Bounty \\#${bountyId}*\n\n` +
+                `*Título:* ${escapeMarkdownV2(bounty.title)}\n\n` +
+                `*Descrição:*\n${escapeMarkdownV2(bounty.short_description)}\n\n` +
+                `👤 *Criado por:* ${creatorDisplay}\n` +
+                `📅 *Data:* ${escapeMarkdownV2(createdAt)}`,
+                { parse_mode: 'MarkdownV2', reply_markup: keyboard.reply_markup }
+            );
+            await ctx.answerCbQuery();
+        } catch (error) {
+            logger.error(`[Bounty Review] Erro: ${error.message}`);
+            await ctx.answerCbQuery('❌ Erro ao carregar bounty');
+        }
+    });
+
+    // Aprovar bounty
+    bot.action(/^bounty_approve:(\d+)$/, requireAdmin, async (ctx) => {
+        try {
+            const bountyId = parseInt(ctx.match[1]);
+            await bountyService.approveBounty(bountyId, ctx.from.id);
+
+            await ctx.editMessageText(
+                `✅ *Bounty #${bountyId} Aprovado!*\n\n` +
+                `O bounty agora está disponível para votação.`,
+                { parse_mode: 'Markdown' }
+            );
+            await ctx.answerCbQuery('✅ Aprovado!');
+        } catch (error) {
+            logger.error(`[Bounty Approve] Erro: ${error.message}`);
+            await ctx.answerCbQuery(`❌ ${error.message}`);
+        }
+    });
+
+    // Rejeitar bounty
+    bot.action(/^bounty_reject:(\d+)$/, requireAdmin, async (ctx) => {
+        try {
+            const bountyId = parseInt(ctx.match[1]);
+            await bountyService.rejectBounty(bountyId, ctx.from.id, 'Rejeitado pelo admin');
+
+            await ctx.editMessageText(
+                `❌ *Bounty #${bountyId} Rejeitado*\n\n` +
+                `O criador foi notificado.`,
+                { parse_mode: 'Markdown' }
+            );
+            await ctx.answerCbQuery('❌ Rejeitado');
+        } catch (error) {
+            logger.error(`[Bounty Reject] Erro: ${error.message}`);
+            await ctx.answerCbQuery(`❌ ${error.message}`);
+        }
+    });
+
+    // Listar bounties aprovadas
+    bot.action('bounty_approved', requireAdmin, async (ctx) => {
+        try {
+            const bounties = await bountyService.listBounties('approved', 10);
+
+            if (bounties.length === 0) {
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('◀️ Voltar', 'adm_bounties')]
+                ]);
+                await ctx.editMessageText(
+                    '✅ *Projetos Aprovados*\n\n' +
+                    'Nenhum projeto aprovado no momento.',
+                    { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
+                );
+                return ctx.answerCbQuery();
+            }
+
+            let text = '✅ *Projetos Aprovados*\n\n';
+            for (const b of bounties) {
+                text += `*\\#${b.ranking || '\\-'}* ${escapeMarkdownV2(b.title.substring(0, 25))}\n`;
+                text += `└ R\\$ ${parseFloat(b.total_brl || 0).toFixed(2).replace('.', '\\.')} \\| ${b.vote_count || 0} votos\n\n`;
+            }
+
+            const buttons = bounties.map(b => [
+                Markup.button.callback(`🗑️ Remover`, `bounty_remove:${b.id}`)
+            ]);
+            buttons.push([Markup.button.callback('◀️ Voltar', 'adm_bounties')]);
+
+            await ctx.editMessageText(text, {
+                parse_mode: 'MarkdownV2',
+                reply_markup: Markup.inlineKeyboard(buttons).reply_markup
+            });
+            await ctx.answerCbQuery();
+        } catch (error) {
+            logger.error(`[Bounty Approved] Erro: ${error.message}`);
+            await ctx.answerCbQuery('❌ Erro');
+        }
+    });
+
+    // Remover bounty
+    bot.action(/^bounty_remove:(\d+)$/, requireAdmin, async (ctx) => {
+        try {
+            const bountyId = parseInt(ctx.match[1]);
+            await bountyService.removeBounty(bountyId, ctx.from.id);
+
+            await ctx.answerCbQuery('✅ Bounty removido');
+            // Recarregar lista
+            await ctx.editMessageText('🗑️ Bounty removido. Voltando...', { parse_mode: 'Markdown' });
+        } catch (error) {
+            logger.error(`[Bounty Remove] Erro: ${error.message}`);
+            await ctx.answerCbQuery(`❌ ${error.message}`);
+        }
+    });
+
+    // Listar claims pendentes (status: taken)
+    bot.action('bounty_taken', requireAdmin, async (ctx) => {
+        try {
+            const bounties = await bountyService.listBounties('taken', 10);
+
+            if (bounties.length === 0) {
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('◀️ Voltar', 'adm_bounties')]
+                ]);
+                await ctx.editMessageText(
+                    '👷 *Claims Pendentes*\n\n' +
+                    'Nenhum claim de desenvolvedor pendente.',
+                    { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
+                );
+                return ctx.answerCbQuery();
+            }
+
+            let text = '👷 *Claims Pendentes de Aprovação*\n\n';
+            const buttons = [];
+            for (const b of bounties) {
+                const devDisplay = b.developer_username
+                    ? `@${escapeMarkdownV2(b.developer_username)}`
+                    : b.developer_telegram_id;
+                text += `📝 *${escapeMarkdownV2(b.title.substring(0, 30))}*\n`;
+                text += `├ Dev: ${devDisplay}\n`;
+                text += `└ Valor: R\\$ ${parseFloat(b.total_brl || 0).toFixed(2).replace('.', '\\.')}\n\n`;
+                buttons.push([
+                    Markup.button.callback(`✅ Aprovar #${b.id}`, `bounty_approve_dev:${b.id}`),
+                    Markup.button.callback(`❌ Recusar`, `bounty_reject_dev:${b.id}`)
+                ]);
+            }
+            buttons.push([Markup.button.callback('◀️ Voltar', 'adm_bounties')]);
+
+            await ctx.editMessageText(text, {
+                parse_mode: 'MarkdownV2',
+                reply_markup: Markup.inlineKeyboard(buttons).reply_markup
+            });
+            await ctx.answerCbQuery();
+        } catch (error) {
+            logger.error(`[Bounty Taken] Erro: ${error.message}`);
+            await ctx.answerCbQuery('❌ Erro');
+        }
+    });
+
+    // Aprovar claim de desenvolvedor
+    bot.action(/^bounty_approve_dev:(\d+)$/, requireAdmin, async (ctx) => {
+        try {
+            const bountyId = parseInt(ctx.match[1]);
+            await bountyService.approveDevClaim(bountyId, ctx.from.id);
+            await ctx.answerCbQuery('✅ Desenvolvedor aprovado!');
+            await ctx.editMessageText('✅ Desenvolvedor aprovado para o bounty!', { parse_mode: 'Markdown' });
+        } catch (error) {
+            logger.error(`[Bounty Approve Dev] Erro: ${error.message}`);
+            await ctx.answerCbQuery(`❌ ${error.message}`);
+        }
+    });
+
+    // Rejeitar claim de desenvolvedor
+    bot.action(/^bounty_reject_dev:(\d+)$/, requireAdmin, async (ctx) => {
+        try {
+            const bountyId = parseInt(ctx.match[1]);
+            await bountyService.rejectDevClaim(bountyId, ctx.from.id);
+            await ctx.answerCbQuery('❌ Claim recusado');
+            await ctx.editMessageText('❌ Claim do desenvolvedor foi recusado. O bounty voltou para status aprovado.', { parse_mode: 'Markdown' });
+        } catch (error) {
+            logger.error(`[Bounty Reject Dev] Erro: ${error.message}`);
+            await ctx.answerCbQuery(`❌ ${error.message}`);
+        }
+    });
+
+    // Listar bounties em desenvolvimento
+    bot.action('bounty_in_dev', requireAdmin, async (ctx) => {
+        try {
+            const bounties = await bountyService.listBounties('in_development', 10);
+
+            if (bounties.length === 0) {
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('◀️ Voltar', 'adm_bounties')]
+                ]);
+                await ctx.editMessageText(
+                    '🔨 *Em Desenvolvimento*\n\n' +
+                    'Nenhum bounty em desenvolvimento.',
+                    { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
+                );
+                return ctx.answerCbQuery();
+            }
+
+            let text = '🔨 *Recompensas Em Desenvolvimento*\n\n';
+            for (const b of bounties) {
+                const startedAt = b.developer_approved_at ? new Date(b.developer_approved_at).toLocaleDateString('pt-BR') : 'N/A';
+                const devDisplay = b.developer_username
+                    ? `@${escapeMarkdownV2(b.developer_username)}`
+                    : b.developer_telegram_id;
+                text += `📝 *${escapeMarkdownV2(b.title.substring(0, 30))}*\n`;
+                text += `├ Dev: ${devDisplay}\n`;
+                text += `├ Início: ${escapeMarkdownV2(startedAt)}\n`;
+                text += `└ Valor: R\\$ ${parseFloat(b.total_brl || 0).toFixed(2).replace('.', '\\.')}\n\n`;
+            }
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('◀️ Voltar', 'adm_bounties')]
+            ]);
+
+            await ctx.editMessageText(text, {
+                parse_mode: 'MarkdownV2',
+                reply_markup: keyboard.reply_markup
+            });
+            await ctx.answerCbQuery();
+        } catch (error) {
+            logger.error(`[Bounty In Dev] Erro: ${error.message}`);
+            await ctx.answerCbQuery('❌ Erro');
+        }
+    });
+
+    // Listar bounties completadas (aguardando pagamento)
+    bot.action('bounty_completed', requireAdmin, async (ctx) => {
+        try {
+            const bounties = await bountyService.listBounties('completed', 10);
+
+            if (bounties.length === 0) {
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('◀️ Voltar', 'adm_bounties')]
+                ]);
+                await ctx.editMessageText(
+                    '💰 *Completadas (Aguardando Pagamento)*\n\n' +
+                    'Nenhum bounty aguardando pagamento.',
+                    { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
+                );
+                return ctx.answerCbQuery();
+            }
+
+            let text = '💰 *Recompensas Completadas*\n\n';
+            const buttons = [];
+            for (const b of bounties) {
+                const devDisplay = b.developer_username
+                    ? `@${escapeMarkdownV2(b.developer_username)}`
+                    : b.developer_telegram_id;
+                text += `📝 *${escapeMarkdownV2(b.title.substring(0, 30))}*\n`;
+                text += `├ Dev: ${devDisplay}\n`;
+                text += `└ Valor: R\\$ ${parseFloat(b.total_brl || 0).toFixed(2).replace('.', '\\.')}\n\n`;
+                buttons.push([Markup.button.callback(`💵 Marcar como Pago`, `bounty_mark_paid:${b.id}`)]);
+            }
+            buttons.push([Markup.button.callback('◀️ Voltar', 'adm_bounties')]);
+
+            await ctx.editMessageText(text, {
+                parse_mode: 'MarkdownV2',
+                reply_markup: Markup.inlineKeyboard(buttons).reply_markup
+            });
+            await ctx.answerCbQuery();
+        } catch (error) {
+            logger.error(`[Bounty Completed] Erro: ${error.message}`);
+            await ctx.answerCbQuery('❌ Erro');
+        }
+    });
+
+    // Marcar bounty como pago
+    bot.action(/^bounty_mark_paid:(\d+)$/, requireAdmin, async (ctx) => {
+        try {
+            const bountyId = parseInt(ctx.match[1]);
+            await bountyService.markAsPaid(bountyId, ctx.from.id);
+            await ctx.answerCbQuery('✅ Marcado como pago!');
+            await ctx.editMessageText('💵 Bounty marcado como pago! O desenvolvedor foi notificado.', { parse_mode: 'Markdown' });
+        } catch (error) {
+            logger.error(`[Bounty Mark Paid] Erro: ${error.message}`);
+            await ctx.answerCbQuery(`❌ ${error.message}`);
+        }
+    });
+
+    // Estatísticas de bounties
+    bot.action('bounty_stats', requireAdmin, async (ctx) => {
+        try {
+            const stats = await bountyService.getBountyStats();
+
+            const totalBounties = Object.values(stats).reduce((sum, s) => sum + (s.count || 0), 0);
+            const totalBrl = Object.values(stats).reduce((sum, s) => sum + (s.total_brl || 0), 0);
+            const totalVotes = Object.values(stats).reduce((sum, s) => sum + (s.vote_count || 0), 0);
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('◀️ Voltar', 'adm_bounties')]
+            ]);
+
+            await ctx.editMessageText(
+                `📊 *Estatísticas de Projetos*\n\n` +
+                `*Por Status:*\n` +
+                `├ Pendentes: ${stats.pending_review?.count || 0}\n` +
+                `├ Aprovadas: ${stats.approved?.count || 0}\n` +
+                `├ Taken: ${stats.taken?.count || 0}\n` +
+                `├ Em Dev: ${stats.in_development?.count || 0}\n` +
+                `├ Completadas: ${stats.completed?.count || 0}\n` +
+                `├ Pagas: ${stats.paid?.count || 0}\n` +
+                `└ Rejeitadas: ${stats.rejected?.count || 0}\n\n` +
+                `*Totais:*\n` +
+                `├ Total projetos: ${totalBounties}\n` +
+                `├ Total votos: ${totalVotes}\n` +
+                `└ Total arrecadado: R$ ${totalBrl.toFixed(2)}`,
+                { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
+            );
+            await ctx.answerCbQuery();
+        } catch (error) {
+            logger.error(`[Bounty Stats] Erro: ${error.message}`);
+            await ctx.answerCbQuery('❌ Erro');
+        }
+    });
+
+    // Criar bounty (admin)
+    bot.action('bounty_create', requireAdmin, async (ctx) => {
+        try {
+            activeStates.set(ctx.from.id, {
+                action: 'bounty_create_title',
+                step: 1
+            });
+
+            await ctx.editMessageText(
+                '➕ *Criar Nova Recompensa*\n\n' +
+                '*Passo 1/2:* Digite o título (máx. 40 caracteres):\n\n' +
+                '_Envie /cancel para cancelar_',
+                { parse_mode: 'Markdown' }
+            );
+            await ctx.answerCbQuery();
+        } catch (error) {
+            logger.error(`[Bounty Create] Erro: ${error.message}`);
+            await ctx.answerCbQuery('❌ Erro');
+        }
+    });
+
+    // Testar votação (para admin testar o fluxo)
+    bot.action('bounty_test_vote', requireAdmin, async (ctx) => {
+        try {
+            const bounties = await bountyService.listBounties('approved', 5);
+
+            if (bounties.length === 0) {
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('◀️ Voltar', 'adm_bounties')]
+                ]);
+                await ctx.editMessageText(
+                    '🗳️ *Testar Votação*\n\n' +
+                    'Nenhum bounty aprovado para testar.',
+                    { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
+                );
+                return ctx.answerCbQuery();
+            }
+
+            const buttons = bounties.map(b => [
+                Markup.button.callback(`#${b.id}: ${b.title.substring(0, 25)}...`, `bounty_vote_select:${b.id}`)
+            ]);
+            buttons.push([Markup.button.callback('◀️ Voltar', 'adm_bounties')]);
+
+            await ctx.editMessageText(
+                '🗳️ *Testar Votação*\n\n' +
+                'Selecione um bounty para votar:',
+                { parse_mode: 'Markdown', reply_markup: Markup.inlineKeyboard(buttons).reply_markup }
+            );
+            await ctx.answerCbQuery();
+        } catch (error) {
+            logger.error(`[Bounty Test Vote] Erro: ${error.message}`);
+            await ctx.answerCbQuery('❌ Erro');
+        }
+    });
+
+    // Selecionar bounty - menu principal com opções Contribuir ou Trabalhar
+    bot.action(/^bounty_vote_select:(\d+)$/, requireAdmin, async (ctx) => {
+        try {
+            const bountyId = parseInt(ctx.match[1]);
+            const bounty = await bountyService.getBountyById(bountyId);
+
+            if (!bounty || bounty.status !== 'approved') {
+                return ctx.answerCbQuery('❌ Projeto não disponível');
+            }
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('💰 Quero Contribuir', `bounty_contribute:${bountyId}`)],
+                [Markup.button.callback('🛠️ Quero Trabalhar', `bounty_work:${bountyId}`)],
+                [Markup.button.callback('◀️ Voltar', 'bounty_test_vote')]
+            ]);
+
+            await ctx.editMessageText(
+                `🎯 *Projeto \\#${bountyId}*\n\n` +
+                `*${escapeMarkdownV2(bounty.title)}*\n\n` +
+                `${escapeMarkdownV2(bounty.short_description)}\n\n` +
+                `💰 *Recompensa atual:* R\\$ ${parseFloat(bounty.total_brl || 0).toFixed(2).replace('.', '\\.')}\n` +
+                `📊 *Contribuições:* ${bounty.vote_count || 0}\n\n` +
+                `Escolha como deseja participar:`,
+                { parse_mode: 'MarkdownV2', reply_markup: keyboard.reply_markup }
+            );
+            await ctx.answerCbQuery();
+        } catch (error) {
+            logger.error(`[Bounty Select] Erro: ${error.message}`);
+            await ctx.answerCbQuery('❌ Erro');
+        }
+    });
+
+    // ========================================
+    // BOUNTY HANDLERS MOVIDOS PARA handlers.js
+    // (bounty_contribute, bounty_work, bounty_claim, bounty_vote_pix, bounty_vote_liquid)
+    // Agora qualquer usuário pode contribuir/trabalhar em projetos
+    // ========================================
+
+    // ========================================
+    // BOUNTY TEXT HANDLERS
+    // ========================================
+
+    // Handler para título do bounty (step 1)
+    async function handleBountyCreateTitle(ctx, state) {
+        const title = ctx.message.text.trim();
+
+        if (title.length < 5) {
+            await ctx.reply('❌ Título muito curto. Mínimo de 5 caracteres.');
+            return;
+        }
+
+        if (title.length > 40) {
+            await ctx.reply('❌ Título muito longo. Máximo de 40 caracteres.');
+            return;
+        }
+
+        // Salvar título e passar para próximo passo
+        activeStates.set(ctx.from.id, {
+            action: 'bounty_create_desc',
+            title: title
+        });
+
+        await ctx.reply(
+            `✅ Título salvo: *${title}*\n\n` +
+            `📝 *Passo 2/2:* Digite a descrição (até 2000 caracteres):\n\n` +
+            `_Explique o que precisa ser desenvolvido._\n\n` +
+            `_Envie /cancel para cancelar_`,
+            { parse_mode: 'Markdown' }
+        );
+    }
+
+    // Handler para descrição do bounty (step 2) - cria o bounty
+    async function handleBountyCreateDesc(ctx, state) {
+        const description = ctx.message.text.trim();
+
+        if (description.length < 10) {
+            await ctx.reply('❌ Descrição muito curta. Mínimo de 10 caracteres.');
+            return;
+        }
+
+        if (description.length > 2000) {
+            await ctx.reply('❌ Descrição muito longa. Máximo de 2000 caracteres.');
+            return;
+        }
+
+        try {
+            // Criar o bounty
+            const bounty = await bountyService.createBounty({
+                title: state.title,
+                description: description,
+                createdByTelegramId: ctx.from.id,
+                createdByUsername: ctx.from.username
+            });
+
+            const statusEmoji = bounty.status === 'pending_review' ? '⏳' : '✅';
+            const statusText = bounty.status === 'pending_review' ? 'Pendente de Aprovação' : 'Aprovado';
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('📋 Ver Detalhes', `bounty_review:${bounty.id}`)],
+                [Markup.button.callback('◀️ Menu Projetos', 'adm_bounties')]
+            ]);
+
+            await ctx.reply(
+                `✅ *Recompensa Criada!*\n\n` +
+                `📌 *Título:* ${bounty.title}\n` +
+                `📝 *Descrição:* ${bounty.short_description.substring(0, 100)}${bounty.short_description.length > 100 ? '...' : ''}\n` +
+                `📊 *Status:* ${statusEmoji} ${statusText}\n` +
+                `🆔 *ID:* ${bounty.id}\n\n` +
+                `_Recompensa criada com sucesso!_`,
+                { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
+            );
+        } catch (error) {
+            logger.error(`[Bounty Create] Erro: ${error.message}`);
+            await ctx.reply(`❌ Erro ao criar recompensa: ${error.message}`);
+        }
+
+        activeStates.delete(ctx.from.id);
+    }
+
+    // Handler para valor PIX do voto
+    async function handleBountyVotePixAmount(ctx, state) {
+        const text = ctx.message.text.trim().replace(',', '.');
+        const amount = parseFloat(text);
+
+        if (isNaN(amount) || amount <= 0) {
+            await ctx.reply('❌ Valor inválido. Digite um número válido (ex: 50 ou 100.50)');
+            return;
+        }
+
+        if (amount < config.bounties.minPixAmountBrl) {
+            await ctx.reply(`❌ Valor mínimo é R$ ${config.bounties.minPixAmountBrl.toFixed(2)}`);
+            return;
+        }
+
+        if (amount > config.bounties.maxPixAmountBrl) {
+            await ctx.reply(`❌ Valor máximo é R$ ${config.bounties.maxPixAmountBrl.toFixed(2)}`);
+            return;
+        }
+
+        try {
+            const result = await bountyService.createPixPayment(
+                state.bountyId,
+                ctx.from.id,
+                ctx.from.username,
+                amount
+            );
+
+            const { payment, pixData } = result;
+            const qrCode = pixData.qrCode;
+            const qrCodeImage = pixData.qrCodeImage;
+            const expiresAt = pixData.expiresAt;
+
+            // Formatar data de expiração
+            const expireDate = new Date(expiresAt);
+            const expireStr = expireDate.toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('◀️ Voltar', `bounty_contribute:${state.bountyId}`)]
+            ]);
+
+            // Enviar QR code como imagem se disponível
+            if (qrCodeImage && qrCodeImage.startsWith('data:image')) {
+                const base64Data = qrCodeImage.replace(/^data:image\/\w+;base64,/, '');
+                const imageBuffer = Buffer.from(base64Data, 'base64');
+
+                await ctx.replyWithPhoto(
+                    { source: imageBuffer },
+                    {
+                        caption: `💳 *Contribuição PIX*\n\n` +
+                            `*Valor:* R$ ${amount.toFixed(2)}\n` +
+                            `*Expira:* ${expireStr}`,
+                        parse_mode: 'Markdown'
+                    }
+                );
+
+                await ctx.reply(
+                    `\`${qrCode}\`\n\n` +
+                    `_Toque para copiar e cole no app do banco_`,
+                    { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
+                );
+            } else {
+                // Fallback sem imagem
+                await ctx.reply(
+                    `💳 *Contribuição PIX*\n\n` +
+                    `*Valor:* R$ ${amount.toFixed(2)}\n` +
+                    `*Expira:* ${expireStr}\n\n` +
+                    `\`${qrCode}\`\n\n` +
+                    `_Toque para copiar e cole no app do banco_`,
+                    { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup }
+                );
+            }
+        } catch (error) {
+            logger.error(`[Bounty PIX Amount] Erro: ${error.message}`);
+            await ctx.reply(`❌ Erro ao gerar PIX: ${error.message}`);
+        }
+
+        activeStates.delete(ctx.from.id);
+    }
 
     logger.info('[AdminCommands] Sistema administrativo completo registrado com todos os handlers');
 };

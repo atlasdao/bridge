@@ -1,11 +1,19 @@
 const cron = require('node-cron');
 const logger = require('../core/logger');
+const alertService = require('./alertService');
+const BountyService = require('./bountyService');
 
 class ScheduledJobs {
-    constructor(dbPool, redisConnection) {
+    constructor(dbPool, redisConnection, bot = null) {
         this.dbPool = dbPool;
         this.redisConnection = redisConnection;
+        this.bot = bot;
         this.jobs = new Map();
+        this.isShuttingDown = false;
+    }
+
+    setBot(bot) {
+        this.bot = bot;
     }
 
     /**
@@ -29,38 +37,55 @@ class ScheduledJobs {
         // Schedule verification polling (webhook fallback)
         this.scheduleVerificationPolling();
 
+        // Schedule withdrawal payment monitoring (DePix → PIX)
+        this.scheduleWithdrawalMonitoring();
+
+        // Schedule bounty Liquid payment scanner
+        this.scheduleBountyLiquidScanner();
+
         logger.info('[ScheduledJobs] All jobs initialized');
+    }
+
+    /**
+     * Check if database pool is available
+     */
+    isDatabaseAvailable() {
+        if (this.isShuttingDown) {
+            logger.warn('[ScheduledJobs] Skipping job execution - system is shutting down');
+            return false;
+        }
+
+        if (!this.dbPool || this.dbPool.ended) {
+            logger.error('[ScheduledJobs] Database pool is not available or has been closed');
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Check if Redis is available
+     */
+    isRedisAvailable() {
+        if (this.isShuttingDown) {
+            return false;
+        }
+
+        if (!this.redisConnection || this.redisConnection.status !== 'ready') {
+            logger.error('[ScheduledJobs] Redis connection is not available');
+            return false;
+        }
+
+        return true;
     }
 
     /**
      * Schedule daily limit reset at midnight Brazil time
      */
     scheduleDailyLimitReset() {
-        // Run at 00:00 Brazil time (03:00 UTC)
-        const resetJob = cron.schedule('0 3 * * *', async () => {
-            logger.info('[ScheduledJobs] Starting daily limit reset...');
-
-            try {
-                const result = await this.dbPool.query('SELECT reset_daily_limits()');
-                const resetCount = result.rows[0].reset_daily_limits;
-
-                logger.info(`[ScheduledJobs] Daily limits reset for ${resetCount} users`);
-
-                await this.trackJobExecution('daily_limit_reset', {
-                    success: true,
-                    usersReset: resetCount,
-                    executedAt: new Date().toISOString()
-                });
-
-            } catch (error) {
-                logger.error('[ScheduledJobs] Daily limit reset failed:', error);
-
-                await this.trackJobExecution('daily_limit_reset', {
-                    success: false,
-                    error: error.message,
-                    executedAt: new Date().toISOString()
-                });
-            }
+        // Run at 00:00 Brazil time (midnight)
+        const resetJob = cron.schedule('0 0 * * *', async () => {
+            await this.executeDailyLimitResetWithRetry();
         }, {
             scheduled: true,
             timezone: "America/Sao_Paulo"
@@ -71,12 +96,127 @@ class ScheduledJobs {
     }
 
     /**
+     * Execute daily limit reset with aggressive retry logic
+     * Strategy: 5 cycles of (3 attempts with 30s delay), with 5 min wait between cycles
+     * Total max time: ~30 minutes before giving up
+     */
+    async executeDailyLimitResetWithRetry() {
+        const maxCycles = 5;           // 5 retry cycles
+        const attemptsPerCycle = 3;    // 3 attempts per cycle
+        const attemptDelay = 30000;    // 30 seconds between attempts
+        const cycleDelay = 300000;     // 5 minutes between cycles
+
+        let totalAttempts = 0;
+
+        for (let cycle = 1; cycle <= maxCycles; cycle++) {
+            logger.info(`[ScheduledJobs] Daily limit reset - Starting cycle ${cycle}/${maxCycles}`);
+
+            for (let attempt = 1; attempt <= attemptsPerCycle; attempt++) {
+                totalAttempts++;
+                const attemptLabel = `Cycle ${cycle}/${maxCycles}, Attempt ${attempt}/${attemptsPerCycle} (Total: ${totalAttempts})`;
+
+                if (!this.isDatabaseAvailable()) {
+                    logger.error(`[ScheduledJobs] ${attemptLabel} - Database unavailable`);
+
+                    if (attempt < attemptsPerCycle) {
+                        logger.info(`[ScheduledJobs] Waiting ${attemptDelay/1000}s before next attempt...`);
+                        await new Promise(resolve => setTimeout(resolve, attemptDelay));
+                        continue;
+                    } else if (cycle < maxCycles) {
+                        logger.warn(`[ScheduledJobs] Cycle ${cycle} failed. Waiting ${cycleDelay/1000}s before next cycle...`);
+                        await new Promise(resolve => setTimeout(resolve, cycleDelay));
+                        break; // Move to next cycle
+                    } else {
+                        // All cycles exhausted
+                        logger.error(`[ScheduledJobs] CRITICAL: Daily limit reset failed after ${totalAttempts} attempts across ${maxCycles} cycles`);
+                        await alertService.sendJobFailureAlert('daily_limit_reset',
+                            new Error('Database unavailable after all retries'), {
+                            totalAttempts,
+                            cycles: maxCycles,
+                            lastError: 'Database pool unavailable'
+                        });
+                        return;
+                    }
+                }
+
+                logger.info(`[ScheduledJobs] ${attemptLabel} - Starting daily limit reset...`);
+
+                try {
+                    const result = await this.dbPool.query('SELECT reset_daily_limits()');
+                    const resetCount = result.rows[0].reset_daily_limits;
+
+                    logger.info(`[ScheduledJobs] ✓ SUCCESS - Daily limits reset for ${resetCount} users (${attemptLabel})`);
+
+                    // Enviar alerta de sucesso (job crítico)
+                    await alertService.sendJobSuccessAlert('daily_limit_reset', {
+                        usersReset: resetCount,
+                        totalAttempts,
+                        cycle,
+                        succeededOnAttempt: attempt
+                    });
+
+                    if (this.isRedisAvailable()) {
+                        await this.trackJobExecution('daily_limit_reset', {
+                            success: true,
+                            usersReset: resetCount,
+                            totalAttempts,
+                            cycle,
+                            attempt,
+                            executedAt: new Date().toISOString()
+                        });
+                    }
+
+                    return; // Success! Exit completely
+
+                } catch (error) {
+                    logger.error(`[ScheduledJobs] ${attemptLabel} - Failed:`, error);
+
+                    if (attempt < attemptsPerCycle) {
+                        // More attempts in this cycle
+                        logger.info(`[ScheduledJobs] Waiting ${attemptDelay/1000}s before next attempt...`);
+                        await new Promise(resolve => setTimeout(resolve, attemptDelay));
+                    } else if (cycle < maxCycles) {
+                        // Move to next cycle
+                        logger.warn(`[ScheduledJobs] Cycle ${cycle} failed. Waiting ${cycleDelay/1000}s before next cycle...`);
+                        await new Promise(resolve => setTimeout(resolve, cycleDelay));
+                    } else {
+                        // Final failure - all cycles exhausted
+                        logger.error(`[ScheduledJobs] CRITICAL: Daily limit reset FAILED after ${totalAttempts} attempts across ${maxCycles} cycles`);
+
+                        await alertService.sendJobFailureAlert('daily_limit_reset', error, {
+                            totalAttempts,
+                            cycles: maxCycles,
+                            lastError: error.message,
+                            criticalFailure: true
+                        });
+
+                        if (this.isRedisAvailable()) {
+                            await this.trackJobExecution('daily_limit_reset', {
+                                success: false,
+                                error: error.message,
+                                totalAttempts,
+                                cycles: maxCycles,
+                                executedAt: new Date().toISOString()
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
      * Schedule stats recalculation with optimized batch processing
      * FIXED: N+1 query problem
      */
     scheduleStatsRecalculation() {
         // Run every hour at minute 15
         const statsJob = cron.schedule('15 * * * *', async () => {
+            if (!this.isDatabaseAvailable()) {
+                logger.error('[ScheduledJobs] Skipping stats recalculation - database unavailable');
+                return;
+            }
+
             logger.info('[ScheduledJobs] Starting hourly stats recalculation...');
 
             try {
@@ -97,16 +237,7 @@ class ScheduledJobs {
                 // Extract user IDs
                 const userIds = activeUsersResult.rows.map(row => row.user_id);
 
-                // OPTIMIZED: Batch process all users in a single query
-                const recalcResult = await this.dbPool.query(
-                    'SELECT batch_recalculate_user_stats($1::TEXT[])',
-                    [userIds]
-                );
-
-                const recalculated = recalcResult.rows[0].batch_recalculate_user_stats;
-
-                // Alternative approach: Direct batch update (even more efficient)
-                // This updates all user stats in a single query without calling stored procedures
+                // Direct batch update - Updates all user stats in a single query
                 const directUpdateResult = await this.dbPool.query(`
                     WITH user_stats AS (
                         SELECT
@@ -142,6 +273,9 @@ class ScheduledJobs {
             } catch (error) {
                 logger.error('[ScheduledJobs] Stats recalculation failed:', error);
 
+                // Enviar alerta de falha
+                await alertService.sendJobFailureAlert('stats_recalculation', error);
+
                 await this.trackJobExecution('stats_recalculation', {
                     success: false,
                     error: error.message,
@@ -156,10 +290,11 @@ class ScheduledJobs {
 
     /**
      * Check for pending level upgrades (optimized version)
+     * Now based only on volume, not transaction count
      */
     async checkPendingUpgrades() {
         try {
-            // Get all users eligible for upgrade
+            // Get all users eligible for upgrade (only volume requirement)
             const eligibleUsers = await this.dbPool.query(`
                 SELECT
                     u.telegram_user_id,
@@ -167,7 +302,6 @@ class ScheduledJobs {
                     u.completed_transactions,
                     u.total_volume_brl,
                     rlc.level as next_level,
-                    rlc.min_transactions_for_upgrade as next_tx_req,
                     rlc.min_volume_for_upgrade as next_vol_req
                 FROM users u
                 JOIN reputation_levels_config rlc ON rlc.level = u.reputation_level + 1
@@ -175,7 +309,6 @@ class ScheduledJobs {
                     u.is_verified = true
                     AND u.is_banned = false
                     AND u.reputation_level < 10
-                    AND u.completed_transactions >= rlc.min_transactions_for_upgrade
                     AND u.total_volume_brl >= rlc.min_volume_for_upgrade
                     AND (u.last_level_upgrade IS NULL OR u.last_level_upgrade < NOW() - INTERVAL '24 hours')
             `);
@@ -187,7 +320,7 @@ class ScheduledJobs {
             // Batch upgrade all eligible users
             const userIds = eligibleUsers.rows.map(user => user.telegram_user_id);
 
-            // Perform batch upgrade
+            // Perform batch upgrade (only volume check)
             const upgradeResult = await this.dbPool.query(`
                 WITH upgrades AS (
                     SELECT
@@ -199,7 +332,6 @@ class ScheduledJobs {
                     JOIN reputation_levels_config rlc ON rlc.level = u.reputation_level + 1
                     WHERE
                         u.telegram_user_id = ANY($1::BIGINT[])
-                        AND u.completed_transactions >= rlc.min_transactions_for_upgrade
                         AND u.total_volume_brl >= rlc.min_volume_for_upgrade
                 )
                 UPDATE users u
@@ -233,6 +365,11 @@ class ScheduledJobs {
     scheduleTransactionCleanup() {
         // Run at 02:00 Brazil time
         const cleanupJob = cron.schedule('0 5 * * *', async () => {
+            if (!this.isDatabaseAvailable()) {
+                logger.error('[ScheduledJobs] Skipping transaction cleanup - database unavailable');
+                return;
+            }
+
             logger.info('[ScheduledJobs] Starting transaction cleanup...');
 
             try {
@@ -272,6 +409,9 @@ class ScheduledJobs {
             } catch (error) {
                 logger.error('[ScheduledJobs] Transaction cleanup failed:', error);
 
+                // Enviar alerta de falha
+                await alertService.sendJobFailureAlert('transaction_cleanup', error);
+
                 await this.trackJobExecution('transaction_cleanup', {
                     success: false,
                     error: error.message,
@@ -294,6 +434,10 @@ class ScheduledJobs {
     scheduleUserStateCleanup() {
         // Run every 15 minutes
         const stateCleanupJob = cron.schedule('*/15 * * * *', async () => {
+            if (!this.isDatabaseAvailable()) {
+                return; // Silent skip for frequent jobs
+            }
+
             logger.info('[ScheduledJobs] Cleaning up expired user states...');
 
             try {
@@ -338,6 +482,10 @@ class ScheduledJobs {
 
         // Run every 5 minutes
         const pollingJob = cron.schedule('*/5 * * * *', async () => {
+            if (!this.isDatabaseAvailable()) {
+                return; // Silent skip for frequent jobs
+            }
+
             try {
                 // Find PENDING verifications that are >2 minutes old (give webhooks time to arrive)
                 const pendingVerifications = await this.dbPool.query(`
@@ -483,6 +631,220 @@ class ScheduledJobs {
     }
 
     /**
+     * Schedule monitoring of withdrawal payments (DePix → PIX)
+     * Checks for incoming DePix payments and expires old withdrawals
+     */
+    scheduleWithdrawalMonitoring() {
+        const WithdrawalService = require('./withdrawalService');
+
+        // Run every 10 seconds
+        const withdrawalJob = cron.schedule('*/10 * * * * *', async () => {
+            if (!this.isDatabaseAvailable()) {
+                return; // Silent skip for frequent jobs
+            }
+
+            try {
+                // Lazy initialization of withdrawal service
+                if (!this.withdrawalService) {
+                    this.withdrawalService = new WithdrawalService(this.dbPool, this.bot);
+                } else if (this.bot && !this.withdrawalService.bot) {
+                    this.withdrawalService.bot = this.bot;
+                }
+
+                // Check for incoming payments
+                await this.withdrawalService.checkPendingPayments();
+
+                // Expire old withdrawals (run every minute, not every 10 seconds)
+                const now = new Date();
+                if (now.getSeconds() < 10) {
+                    await this.withdrawalService.expireOldWithdrawals();
+                }
+
+            } catch (error) {
+                logger.error('[ScheduledJobs] Withdrawal monitoring error:', error);
+            }
+        });
+
+        this.jobs.set('withdrawal_monitoring', withdrawalJob);
+        logger.info('[ScheduledJobs] Withdrawal payment monitoring scheduled every 10 seconds');
+    }
+
+    /**
+     * Schedule bounty Liquid payment scanner
+     * Checks for incoming Liquid payments (L-BTC, USDT, DePix) to bounty addresses
+     */
+    scheduleBountyLiquidScanner() {
+        const config = require('../core/config');
+
+        // Only run if bounties are enabled
+        if (!config.bounties?.enabled) {
+            logger.info('[ScheduledJobs] Bounty Liquid scanner not started - bounties disabled');
+            return;
+        }
+
+        // Run every 30 seconds
+        const bountyLiquidJob = cron.schedule('*/30 * * * * *', async () => {
+            if (!this.isDatabaseAvailable()) {
+                return; // Silent skip for frequent jobs
+            }
+
+            try {
+                // Lazy initialization of bounty service
+                if (!this.bountyService) {
+                    this.bountyService = new BountyService(this.dbPool, this.bot);
+                } else if (this.bot && !this.bountyService.bot) {
+                    this.bountyService.bot = this.bot;
+                }
+
+                // Get pending Liquid bounty payments (older than 30 seconds to allow for propagation)
+                const pendingPayments = await this.dbPool.query(`
+                    SELECT
+                        bp.id,
+                        bp.bounty_id,
+                        bp.telegram_user_id,
+                        bp.payment_method,
+                        bp.liquid_address,
+                        bp.address_index,
+                        bp.created_at
+                    FROM bounty_payments bp
+                    WHERE bp.status = 'pending'
+                        AND bp.payment_method IN ('LIQUID_LBTC', 'LIQUID_USDT', 'LIQUID_DEPIX')
+                        AND bp.liquid_address IS NOT NULL
+                        AND bp.created_at < NOW() - INTERVAL '30 seconds'
+                        AND bp.created_at > NOW() - INTERVAL '24 hours'
+                    ORDER BY bp.created_at ASC
+                    LIMIT 20
+                `);
+
+                if (pendingPayments.rowCount === 0) {
+                    return;
+                }
+
+                logger.info(`[BountyScanner] Checking ${pendingPayments.rowCount} pending Liquid bounty payments`);
+
+                let processed = 0;
+                let errors = 0;
+
+                for (const payment of pendingPayments.rows) {
+                    try {
+                        // Check address balance using LiquidWalletService
+                        const balanceResult = await this.checkBountyAddressBalance(
+                            payment.address_index,
+                            payment.payment_method,
+                            payment.liquid_address
+                        );
+
+                        if (balanceResult && balanceResult.amount > 0) {
+                            // Payment received!
+                            logger.info(`[BountyScanner] Detected payment for bounty ${payment.bounty_id}: ${balanceResult.amount} ${payment.payment_method}`);
+
+                            // Process the payment
+                            await this.bountyService.confirmLiquidPaymentById(
+                                payment.id,
+                                balanceResult.amount,
+                                balanceResult.txid
+                            );
+
+                            processed++;
+                        }
+                    } catch (error) {
+                        logger.error(`[BountyScanner] Error checking payment ${payment.id}: ${error.message}`);
+                        errors++;
+
+                        // Mark as expired if it's been more than 12 hours
+                        const ageHours = (Date.now() - new Date(payment.created_at).getTime()) / (1000 * 60 * 60);
+                        if (ageHours > 12) {
+                            await this.dbPool.query(
+                                `UPDATE bounty_payments SET status = 'EXPIRED', updated_at = NOW() WHERE id = $1`,
+                                [payment.id]
+                            );
+                        }
+                    }
+                }
+
+                if (processed > 0) {
+                    logger.info(`[BountyScanner] Processed ${processed} bounty Liquid payments`);
+                }
+
+                if (processed > 0 || errors > 0) {
+                    await this.trackJobExecution('bounty_liquid_scanner', {
+                        success: true,
+                        processed,
+                        errors,
+                        pending: pendingPayments.rowCount - processed - errors,
+                        executedAt: new Date().toISOString()
+                    });
+                }
+
+            } catch (error) {
+                logger.error('[ScheduledJobs] Bounty Liquid scanner error:', error);
+            }
+        });
+
+        this.jobs.set('bounty_liquid_scanner', bountyLiquidJob);
+        logger.info('[ScheduledJobs] Bounty Liquid payment scanner scheduled every 30 seconds');
+    }
+
+    /**
+     * Check balance for a bounty address using LWK (can decrypt confidential amounts)
+     * @param {number} addressIndex - Address derivation index
+     * @param {string} paymentType - LIQUID_LBTC, LIQUID_USDT, or LIQUID_DEPIX
+     * @param {string} liquidAddress - The Liquid address to check
+     * @returns {Object|null} { amount, txid } or null if no payment found
+     */
+    async checkBountyAddressBalance(addressIndex, paymentType, liquidAddress) {
+        // Map payment type to asset type for LWK
+        const assetTypeMap = {
+            'LIQUID_DEPIX': 'DEPIX',
+            'LIQUID_LBTC': 'LBTC',
+            'LIQUID_USDT': 'USDT'
+        };
+
+        const assetType = assetTypeMap[paymentType];
+        if (!assetType) {
+            logger.warn(`[BountyScanner] Unknown payment type: ${paymentType}`);
+            return null;
+        }
+
+        try {
+            const { execFile } = require('child_process');
+            const { promisify } = require('util');
+            const path = require('path');
+            const execFileAsync = promisify(execFile);
+
+            const LWK_SCRIPT_PATH = path.join(__dirname, '../../scripts/lwk_address.py');
+
+            // Use LWK to check payment - it can decrypt confidential amounts
+            const { stdout } = await execFileAsync('python3', [LWK_SCRIPT_PATH, 'check_payment', addressIndex.toString(), assetType], {
+                timeout: 60000,
+                env: { ...process.env, HOME: '/home/cmo' }
+            });
+
+            const result = JSON.parse(stdout.trim());
+
+            if (!result.success) {
+                logger.error(`[BountyScanner] LWK check_payment error: ${result.error}`);
+                return null;
+            }
+
+            if (result.found && result.total_amount > 0) {
+                logger.info(`[BountyScanner] LWK detected ${assetType} payment: index=${addressIndex}, amount=${result.total_amount}, txid=${result.txid}`);
+                return {
+                    amount: result.total_amount,
+                    txid: result.txid,
+                    assetType: assetType
+                };
+            }
+
+            return null;
+
+        } catch (error) {
+            logger.error(`[BountyScanner] Error checking address balance via LWK: ${error.message}`);
+            return null;
+        }
+    }
+
+    /**
      * Track job execution in Redis for monitoring
      */
     async trackJobExecution(jobName, data) {
@@ -554,17 +916,33 @@ class ScheduledJobs {
     }
 
     /**
-     * Stop all scheduled jobs
+     * Graceful shutdown - stop all scheduled jobs safely
      */
-    stop() {
-        logger.info('[ScheduledJobs] Stopping all scheduled jobs...');
+    async gracefulShutdown() {
+        logger.info('[ScheduledJobs] Starting graceful shutdown...');
+        this.isShuttingDown = true;
+
+        // Wait a bit for any running jobs to complete
+        await new Promise(resolve => setTimeout(resolve, 2000));
 
         for (const [name, job] of this.jobs) {
-            job.stop();
-            logger.info(`[ScheduledJobs] Stopped job: ${name}`);
+            try {
+                job.stop();
+                logger.info(`[ScheduledJobs] Stopped job: ${name}`);
+            } catch (error) {
+                logger.error(`[ScheduledJobs] Error stopping job ${name}:`, error);
+            }
         }
 
         this.jobs.clear();
+        logger.info('[ScheduledJobs] Graceful shutdown completed');
+    }
+
+    /**
+     * Stop all scheduled jobs (legacy method, now calls gracefulShutdown)
+     */
+    stop() {
+        return this.gracefulShutdown();
     }
 
     /**

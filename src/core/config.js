@@ -16,6 +16,17 @@ const config = {
         apiJwtToken: process.env.DEPIX_API_JWT_TOKEN,
         webhookSecret: process.env.DEPIX_WEBHOOK_SECRET,
     },
+    atlas: {
+        apiBaseUrl: process.env.ATLAS_API_BASE_URL || 'https://api.atlasdao.info/api/v1',
+        apiKey: process.env.ATLAS_API_KEY,
+        webhookSecret: process.env.ATLAS_WEBHOOK_SECRET || '270f8423cdaf1ac5253187a1f0a394e61d24dc06c3384ea8e78669bfa653078c',
+    },
+    bounties: {
+        enabled: process.env.BOUNTIES_ENABLED === 'true',
+        minPixAmountBrl: parseFloat(process.env.BOUNTY_MIN_PIX_AMOUNT) || 10,
+        maxPixAmountBrl: parseFloat(process.env.BOUNTY_MAX_PIX_AMOUNT) || 3000,
+        addressIndexStart: 10000,  // Bounty addresses start at 10000 (withdrawals use 0-9999)
+    },
     supabase: {
         url: process.env.SUPABASE_URL,
         serviceKey: process.env.SUPABASE_SERVICE_KEY,
@@ -66,5 +77,12 @@ logger.info(`Configuration loaded for NODE_ENV: "${config.app.nodeEnv}"`);
 logger.info(`Using App Base URL: ${config.app.baseUrl}`);
 logger.info(`Using App Port: ${config.app.port}`);
 logger.info(`Using Redis DB: ${config.redis.db}`);
+
+// Log bounties configuration
+if (config.bounties.enabled) {
+    logger.info(`Bounties system ENABLED - Atlas API: ${config.atlas.apiBaseUrl}`);
+} else {
+    logger.info(`Bounties system disabled (set BOUNTIES_ENABLED=true to enable)`);
+}
 
 module.exports = config;

@@ -6,6 +6,7 @@ const safeCompare = require('safe-compare');
 const { Markup } = require('telegraf');
 const securityService = require('../services/securityService');
 const uxService = require('../services/userExperienceService');
+const BountyService = require('../services/bountyService');
 
 /**
  * Process webhook with proper transaction isolation and idempotency
@@ -20,6 +21,7 @@ const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expira
     const blockchainTxID = webhookData.blockchainTxID || null;
     const payerCpfCnpj = webhookData.payerTaxNumber || null;
     const payerName = webhookData.payerName || null;
+    const euid = webhookData.euid || null;
 
     if (!qrId) {
         logger.error('[Process] Missing qrId in webhook data.');
@@ -54,7 +56,9 @@ const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expira
                 qr_code_message_id,
                 reminder_message_id,
                 payment_status,
-                webhook_processed_count
+                webhook_processed_count,
+                contribution_fee_percent,
+                contribution_amount_brl
             FROM pix_transactions
             WHERE depix_api_entry_id = $1
             FOR UPDATE`, // Lock the row for this transaction
@@ -75,7 +79,9 @@ const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expira
             qr_code_message_id: qrMessageId,
             reminder_message_id: reminderMessageId,
             payment_status: currentStatus,
-            webhook_processed_count: processedCount
+            webhook_processed_count: processedCount,
+            contribution_fee_percent: contributionFeePercent,
+            contribution_amount_brl: contributionAmountBrl
         } = transaction;
 
         // Idempotency check - if already processed with same status, skip
@@ -96,36 +102,38 @@ const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expira
             }
         }
 
-        // Get user information for validation - ALWAYS validate CPF/CNPJ regardless of verification status
+        // Get user information for validation - usando EUID (não mais CPF)
         const userCheck = await client.query(
-            'SELECT payer_cpf_cnpj, is_verified FROM users WHERE telegram_user_id = $1',
+            'SELECT payer_cpf_cnpj, is_verified, euid FROM users WHERE telegram_user_id = $1',
             [recipientTelegramUserId]
         );
 
         const userInfo = userCheck.rows[0];
-        let cpfCnpjValid = true;
+        let euidValid = true;
         let refundReason = null;
 
-        // CRITICAL FIX: Always validate CPF/CNPJ if both are present, regardless of verification status
-        if (userInfo && userInfo.payer_cpf_cnpj && payerCpfCnpj) {
-            const normalizedExpected = userInfo.payer_cpf_cnpj.replace(/[^0-9]/g, '');
-            const normalizedActual = payerCpfCnpj.replace(/[^0-9]/g, '');
-
-            if (normalizedExpected !== normalizedActual) {
-                cpfCnpjValid = false;
-                refundReason = `CPF/CNPJ diferente do cadastrado. Esperado: ${userInfo.payer_cpf_cnpj}`;
-                logger.warn(`[Process] CPF/CNPJ mismatch for user ${recipientTelegramUserId}. Expected: ${normalizedExpected}, Got: ${normalizedActual}`);
+        // Validação por EUID (não mais por CPF - Eulen alterou regras de privacidade)
+        if (userInfo && userInfo.euid && euid) {
+            // Usuário tem EUID salvo - validar se bate com o webhook
+            if (userInfo.euid !== euid) {
+                euidValid = false;
+                refundReason = `Conta diferente da cadastrada`;
+                logger.warn(`[Process] EUID mismatch for user ${recipientTelegramUserId}. Expected: ${userInfo.euid}, Got: ${euid}`);
             }
+        } else if (!userInfo || !userInfo.euid) {
+            // Usuário NÃO tem EUID salvo - aceitar pagamento (primeira transação)
+            // EUID será salvo após confirmação
+            logger.info(`[Process] User ${recipientTelegramUserId} has no EUID saved - accepting payment without validation`);
         }
 
         // Determine new payment status
         let newPaymentStatus;
         if (status === 'depix_sent') {
-            if (cpfCnpjValid) {
+            if (euidValid) {
                 newPaymentStatus = 'CONFIRMED';
             } else {
                 newPaymentStatus = 'REFUNDED';
-                refundReason = refundReason || 'Validação de CPF/CNPJ falhou';
+                refundReason = refundReason || 'Conta diferente da cadastrada';
             }
         } else if (['canceled', 'error', 'refunded', 'expired'].includes(status)) {
             newPaymentStatus = 'FAILED';
@@ -154,7 +162,7 @@ const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expira
                 blockchainTxID,
                 payerCpfCnpj || null,
                 payerName || null,
-                cpfCnpjValid,
+                euidValid,
                 newPaymentStatus === 'REFUNDED' ? 'PENDING' : null,
                 refundReason,
                 ourTransactionId
@@ -194,6 +202,21 @@ const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expira
             // Store streak and XP info for notifications
             webhookData.newStreak = newStreak;
             webhookData.xpResult = xpResult;
+
+            // Store contribution info for notifications
+            webhookData.contributionFeePercent = contributionFeePercent;
+            webhookData.contributionAmountBrl = contributionAmountBrl;
+
+            // Salvar EUID se vier no webhook e usuário ainda não tiver
+            if (euid) {
+                await client.query(
+                    `UPDATE users
+                    SET euid = $1, updated_at = NOW()
+                    WHERE telegram_user_id = $2 AND (euid IS NULL OR euid = '')`,
+                    [euid, recipientTelegramUserId]
+                );
+                logger.info(`[Process] EUID saved for user ${recipientTelegramUserId}: ${euid}`);
+            }
         }
 
         // Commit the transaction - all operations succeed or all fail
@@ -215,7 +238,9 @@ const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expira
             reminderMessageId,
             webhookData.newStreak,
             webhookData.xpResult,
-            client
+            dbPool,
+            webhookData.contributionFeePercent,
+            webhookData.contributionAmountBrl
         );
 
         return { success: true, message: 'Webhook processed successfully.' };
@@ -260,7 +285,7 @@ const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expira
  */
 const processVerificationWebhook = async (verification, webhookData, dbPool, bot) => {
     const { verification_id, telegram_user_id, verification_status } = verification;
-    const { status, payerTaxNumber, payerName: webhookPayerName } = webhookData;
+    const { status, payerTaxNumber, payerName: webhookPayerName, euid } = webhookData;
 
     logger.info(`[ProcessVerification] Processing verification ${verification_id} with status ${status}, payer data: ${JSON.stringify({payerTaxNumber, payerName: webhookPayerName})}`);
 
@@ -288,20 +313,25 @@ const processVerificationWebhook = async (verification, webhookData, dbPool, bot
             const payerCpf = payerTaxNumber || null;
             const payerName = webhookPayerName || null;
 
-            // Update user as verified
+            // Update user as verified and save EUID
             await client.query(
                 `UPDATE users
                 SET is_verified = true,
                     payer_cpf_cnpj = COALESCE($1, payer_cpf_cnpj),
                     payer_name = COALESCE($2, payer_name),
+                    euid = COALESCE($4, euid),
                     verification_payment_date = NOW(),
                     verified_at = NOW(),
                     reputation_level = CASE WHEN reputation_level = 0 THEN 1 ELSE reputation_level END,
                     daily_limit_brl = CASE WHEN reputation_level = 0 THEN 50 ELSE daily_limit_brl END,
                     updated_at = NOW()
                 WHERE telegram_user_id = $3`,
-                [payerCpf, payerName, telegram_user_id]
+                [payerCpf, payerName, telegram_user_id, euid]
             );
+
+            if (euid) {
+                logger.info(`[ProcessVerification] EUID saved for user ${telegram_user_id}: ${euid}`);
+            }
 
             // Update verification transaction
             await client.query(
@@ -385,12 +415,17 @@ const sendNotifications = async (
     reminderMessageId,
     newStreak,
     xpResult,
-    dbClient
+    dbPool,
+    contributionFeePercent,
+    contributionAmountBrl
 ) => {
     if (!bot || !recipientTelegramUserId) {
         logger.error(`[Process] Cannot send notification: bot or userId missing.`);
         return;
     }
+
+    // Constantes da competição
+    const COMPETITION_ID = '2024-11-26_2024-12-26';
 
     // Delete old messages
     if (qrMessageId) {
@@ -415,7 +450,7 @@ const sendNotifications = async (
     let userMessage;
     if (newPaymentStatus === 'CONFIRMED') {
         // Get smart success message based on user achievements
-        const successMessage = await uxService.getSuccessMessage(dbClient, recipientTelegramUserId, requestedAmountBRL);
+        const successMessage = await uxService.getSuccessMessage(dbPool, recipientTelegramUserId, requestedAmountBRL);
 
         userMessage = `${escapeMarkdownV2(successMessage)}\n\n` +
             `💰 Valor: R\\$ ${escapeMarkdownV2(Number(requestedAmountBRL).toFixed(2))}\n`;
@@ -452,50 +487,76 @@ const sendNotifications = async (
             reply_markup: mainMenuKeyboard.reply_markup
         });
 
-        // Send post-purchase message after successful transaction
+        // Update contribution ranking if user contributed
+        if (contributionAmountBrl && parseFloat(contributionAmountBrl) > 0) {
+            try {
+                await dbPool.query(`
+                    INSERT INTO contribution_ranking
+                        (telegram_user_id, competition_id, total_contribution_brl, transaction_count)
+                    VALUES ($1, $2, $3, 1)
+                    ON CONFLICT (telegram_user_id, competition_id)
+                    DO UPDATE SET
+                        total_contribution_brl = contribution_ranking.total_contribution_brl + $3,
+                        transaction_count = contribution_ranking.transaction_count + 1,
+                        updated_at = NOW()
+                `, [recipientTelegramUserId, COMPETITION_ID, parseFloat(contributionAmountBrl)]);
+
+                logger.info(`[RANKING] Updated ranking for user ${recipientTelegramUserId}: +R$ ${contributionAmountBrl}`);
+            } catch (rankingError) {
+                logger.error(`[RANKING] Error updating ranking:`, rankingError);
+            }
+        }
+
+        // Send contribution suggestion after 5 seconds (subtle)
         setTimeout(async () => {
             try {
-                // Get post-purchase message from config
-                const { rows } = await dbClient.query(
-                    "SELECT value FROM system_config WHERE key = 'post_purchase_message' AND active = true"
-                );
+                const currentFee = parseFloat(contributionFeePercent) || 0;
+                const MAX_FEE = 20.00;
 
-                if (rows.length > 0 && rows[0].value) {
-                    // Format message with markdown support
-                    const postPurchaseMessage = rows[0].value
-                        .replace(/\*/g, '\\*')
-                        .replace(/_/g, '\\_')
-                        .replace(/\[/g, '\\[')
-                        .replace(/\]/g, '\\]')
-                        .replace(/\(/g, '\\(')
-                        .replace(/\)/g, '\\)')
-                        .replace(/~/g, '\\~')
-                        .replace(/`/g, '\\`')
-                        .replace(/>/g, '\\>')
-                        .replace(/#/g, '\\#')
-                        .replace(/\+/g, '\\+')
-                        .replace(/-/g, '\\-')
-                        .replace(/=/g, '\\=')
-                        .replace(/\|/g, '\\|')
-                        .replace(/\{/g, '\\{')
-                        .replace(/\}/g, '\\}')
-                        .replace(/\./g, '\\.')
-                        .replace(/!/g, '\\!');
+                // Don't suggest if already at max
+                if (currentFee >= MAX_FEE) return;
 
-                    await bot.telegram.sendMessage(recipientTelegramUserId, postPurchaseMessage, {
-                        parse_mode: 'MarkdownV2'
-                    });
+                // Calculate options: +0.25% and +0.50% from current
+                const option1 = parseFloat((currentFee + 0.25).toFixed(2));
+                const option2 = parseFloat((currentFee + 0.50).toFixed(2));
+
+                const options = [];
+                if (option1 <= MAX_FEE) options.push(option1);
+                if (option2 <= MAX_FEE) options.push(option2);
+
+                if (options.length === 0) return;
+
+                let suggestionMessage;
+                if (currentFee === 0) {
+                    suggestionMessage = `💝 *Quer apoiar a Atlas?*\n\n` +
+                        `Sua contribuição voluntária ajuda a manter o serviço no ar e desenvolver ferramentas pró\\-liberdade\\.`;
+                } else {
+                    suggestionMessage = `💝 *Obrigado por apoiar a Atlas\\!*\n\n` +
+                        `Quer alterar sua contribuição?`;
                 }
-            } catch (error) {
-                logger.error(`[Process] Error sending post-purchase message:`, error);
+
+                const keyboard = [];
+                const optionButtons = options.map(f =>
+                    Markup.button.callback(`${f.toFixed(2)}%`, `contribution_set:${f.toFixed(2)}`)
+                );
+                keyboard.push(optionButtons);
+                keyboard.push([Markup.button.callback('Agora não', 'dismiss_contribution_suggestion')]);
+
+                await bot.telegram.sendMessage(recipientTelegramUserId, suggestionMessage, {
+                    parse_mode: 'MarkdownV2',
+                    ...Markup.inlineKeyboard(keyboard)
+                });
+
+            } catch (suggestionError) {
+                logger.error(`[CONTRIBUTION] Error sending suggestion:`, suggestionError);
             }
-        }, 3000); // Send after 3 seconds
+        }, 2000); // Send after 2 seconds
 
     } else if (newPaymentStatus === 'REFUNDED') {
         userMessage = `⚠️ **Pagamento será reembolsado**\n\n` +
             `O pagamento de R\\$ ${escapeMarkdownV2(Number(requestedAmountBRL).toFixed(2))} será reembolsado\\.\n\n` +
-            `**Motivo:** ${escapeMarkdownV2(refundReason || 'CPF/CNPJ diferente do cadastrado')}\n\n` +
-            `⚠️ Você deve pagar sempre com o mesmo CPF/CNPJ cadastrado: **${escapeMarkdownV2(userInfo?.payer_cpf_cnpj || 'N/A')}**\n\n` +
+            `**Motivo:** ${escapeMarkdownV2(refundReason || 'Conta diferente da cadastrada')}\n\n` +
+            `⚠️ Você deve pagar sempre com a mesma conta bancária da primeira transação\\.\n\n` +
             `O valor retornará à sua conta em até 24 horas\\.`;
 
         await bot.telegram.sendMessage(recipientTelegramUserId, userMessage, {
@@ -559,6 +620,48 @@ const createWebhookRoutes = (bot, dbPool, expectationQueue, expirationQueue) => 
 
         } catch (error) {
             logger.error(`[Router] Error handling webhook:`, error);
+            res.status(500).send('Internal Server Error');
+        }
+    });
+
+    // ==========================================
+    // ATLAS WEBHOOK (for Bounties)
+    // ==========================================
+    router.post('/atlas', async (req, res) => {
+        try {
+            logger.info(`--- Atlas Webhook Received on [${config.app.nodeEnv}] from IP [${req.ip}] ---`);
+            logger.info(`[Atlas Webhook] Payload: ${JSON.stringify(req.body)}`);
+
+            // Validate webhook secret if present in headers
+            const webhookSecret = req.headers['x-webhook-secret'];
+            if (webhookSecret && !safeCompare(webhookSecret, config.atlas.webhookSecret)) {
+                logger.warn('[Atlas Webhook] Invalid webhook secret');
+                return res.status(401).send('Unauthorized');
+            }
+
+            const webhookData = req.body;
+
+            // Atlas webhook format includes event type
+            if (!webhookData.id) {
+                logger.warn('[Atlas Webhook] Missing transaction ID');
+                return res.status(400).send('Bad Request: Missing id');
+            }
+
+            // Respond immediately
+            res.status(200).send('OK');
+
+            // Process in background
+            setImmediate(async () => {
+                try {
+                    const bountyService = new BountyService(dbPool, bot);
+                    await bountyService.processAtlasWebhook(webhookData);
+                } catch (bgError) {
+                    logger.error('[Atlas Webhook] Background processing error:', bgError);
+                }
+            });
+
+        } catch (error) {
+            logger.error('[Atlas Webhook] Error:', error);
             res.status(500).send('Internal Server Error');
         }
     });

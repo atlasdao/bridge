@@ -83,12 +83,12 @@ registerBotHandlers(bot, dbPool, expectationMessageQueue, expirationQueue);
 initializeExpectationWorker(dbPool, getBotInstance);
 initializeExpirationWorker(dbPool, getBotInstance);
 
-// Iniciar o monitor do DePix
-depixMonitor.setDbPool(dbPool);
-depixMonitor.start();
+// Monitor do DePix desativado - causando problemas
+// depixMonitor.setDbPool(dbPool);
+// depixMonitor.start();
 
-// Initialize scheduled jobs service
-const scheduledJobs = new ScheduledJobsService(dbPool, mainRedisConnection);
+// Initialize scheduled jobs service (bot will be set after launch)
+const scheduledJobs = new ScheduledJobsService(dbPool, mainRedisConnection, bot);
 scheduledJobs.initialize().then(() => {
     logger.info('[App] Scheduled jobs service initialized successfully');
 }).catch(err => {
@@ -198,12 +198,13 @@ const gracefulShutdown = async (signal) => {
         } catch (err) {
             logger.error('Error stopping Telegram bot:', err.message);
         }
-        try {
-            depixMonitor.stop();
-            logger.info('DePix monitor stopped.');
-        } catch (err) {
-            logger.error('Error stopping DePix monitor:', err.message);
-        }
+        // Monitor desativado
+        // try {
+        //     depixMonitor.stop();
+        //     logger.info('DePix monitor stopped.');
+        // } catch (err) {
+        //     logger.error('Error stopping DePix monitor:', err.message);
+        // }
         try {
             if (expectationMessageQueue) await expectationMessageQueue.close();
             if (expirationQueue) await expirationQueue.close();

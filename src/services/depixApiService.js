@@ -4,6 +4,9 @@ const { v4: uuidv4 } = require('uuid');
 const config = require('../core/config');
 const logger = require('../core/logger');
 
+// Endereço Atlas para receber contribuições via splitFee
+const ATLAS_SPLIT_ADDRESS = 'VJLBCUaw6GL8AuyjsrwpwTYNCUfUxPVTfxxffNTEZMKEjSwamWL6YqUUWLvz89ts1scTDKYoTF8oruMX';
+
 const depixApi = axios.create({
     baseURL: config.depix.apiBaseUrl,
     timeout: 20000, 
@@ -61,12 +64,16 @@ const ping = async () => {
     try {
         const data = await depixApi.get('/ping');
         const isOk = data?.response?.msg === 'Pong!';
-        if (isOk) logger.info('DePix API /ping successful.');
-        else logger.warn('DePix API /ping did not return "Pong!" as expected.');
-        return isOk;
+        if (isOk) {
+            logger.info('DePix API /ping successful.');
+            return { success: true };
+        } else {
+            logger.warn('DePix API /ping did not return "Pong!" as expected.');
+            return { success: false, error: 'Invalid ping response' };
+        }
     } catch (error) {
-        logger.error('DePix API /ping failed.');
-        return false;
+        logger.error('DePix API /ping failed:', error.message);
+        return { success: false, error: error.message };
     }
 };
 
@@ -80,11 +87,26 @@ const generatePixForDeposit = async (amountInCents, userLiquidAddress, webhookUr
         callback_url: webhookUrl,
     };
 
-    // Adicionar informações do pagador se disponíveis
-    if (userInfo.payerName && userInfo.payerDocument) {
-        payload.payerName = userInfo.payerName;
-        payload.payerTaxNumber = userInfo.payerDocument; // CPF ou CNPJ
-        logger.info('Including payer info in PIX QR code generation');
+    // Adicionar splitFee se usuário tem contribuição configurada
+    if (userInfo.contributionFee && parseFloat(userInfo.contributionFee) > 0) {
+        payload.depixSplitAddress = ATLAS_SPLIT_ADDRESS;
+        payload.splitFee = `${userInfo.contributionFee}%`;
+        logger.info(`[CONTRIBUTION] Adding splitFee: ${userInfo.contributionFee}% to Atlas address`);
+    }
+
+    // Lógica de identificação do usuário:
+    // 1. Se tem EUID (usuário já fez transação antes): usa EUID (apenas dono pode pagar)
+    // 2. Se não tem EUID: QR aberto (EUID será capturado do webhook)
+    // Nota: Eulen alterou regras - CPF não é mais usado para identificação
+
+    if (userInfo.euid) {
+        // Usuário já tem EUID - apenas dono do EUID pode pagar
+        payload.euid = userInfo.euid;
+        logger.info('Using EUID for transaction:', payload.euid);
+    } else {
+        // Usuário não tem EUID - gerar QR aberto
+        // O EUID virá no webhook e será salvo para futuras transações
+        logger.info('Generating open QR code - EUID will be captured from webhook');
     }
     try {
         const data = await depixApi.post('/deposit', payload); 

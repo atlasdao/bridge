@@ -8,15 +8,29 @@ const logger = require('../core/logger');
  */
 async function checkBlacklist(dbPool, params) {
     try {
+        // Separar CPF e CNPJ se o campo cpf_cnpj for fornecido
+        let cpf = null;
+        let cnpj = null;
+
+        if (params.cpf_cnpj) {
+            // Se tem 11 dígitos é CPF, se tem 14 é CNPJ
+            const cleanDoc = params.cpf_cnpj.replace(/\D/g, '');
+            if (cleanDoc.length === 11) {
+                cpf = params.cpf_cnpj;
+            } else if (cleanDoc.length === 14) {
+                cnpj = params.cpf_cnpj;
+            }
+        }
+
         const result = await dbPool.query(
             `SELECT * FROM check_user_banned($1, $2, $3, $4, $5, $6)`,
             [
                 params.telegram_id || null,
                 params.telegram_username || null,
-                params.cpf_cnpj || null,
-                params.email || null,
+                cpf,
+                cnpj,
                 params.phone || null,
-                params.full_name || null
+                params.email || null
             ]
         );
 
