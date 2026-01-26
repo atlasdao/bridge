@@ -29,7 +29,7 @@ class AuditService {
                     action_description,
                     target_user_id,
                     target_username,
-                    metadata,
+                    details,
                     ip_address,
                     created_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())`,
@@ -75,7 +75,7 @@ class AuditService {
                 action_description,
                 target_user_id,
                 target_username,
-                metadata,
+                details,
                 ip_address,
                 created_at
             FROM admin_audit_log

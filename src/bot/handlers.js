@@ -1743,13 +1743,22 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
                 whereClause += ` AND payment_status IN ('CONFIRMED', 'PAID')`;
             }
 
-            // Get total count
+            // Get total count and total approved amount
             const { rows: countResult } = await dbPool.query(
                 `SELECT COUNT(*) as total FROM pix_transactions ${whereClause}`,
                 [ctx.from.id]
             );
             const totalTransactions = parseInt(countResult[0].total);
             const totalPages = Math.ceil(totalTransactions / itemsPerPage);
+
+            // Get total approved purchases (sum of all confirmed/paid transactions)
+            const { rows: totalResult } = await dbPool.query(
+                `SELECT COALESCE(SUM(requested_brl_amount), 0) as total_brl
+                 FROM pix_transactions
+                 WHERE user_id = $1 AND payment_status IN ('CONFIRMED', 'PAID')`,
+                [ctx.from.id]
+            );
+            const totalApprovedBrl = parseFloat(totalResult[0].total_brl);
 
             // Get transactions for current page
             const { rows: transactions } = await dbPool.query(
@@ -1764,6 +1773,9 @@ const registerBotHandlers = (bot, dbPool, expectationMessageQueue, expirationQue
             let message = filter === 'approved'
                 ? `📜 **Transações Aprovadas**\n\n`
                 : `📜 **Histórico de Transações**\n\n`;
+
+            // Show total approved purchases
+            message += `💰 *Total de compras:* R\\$ ${escapeMarkdownV2(totalApprovedBrl.toFixed(2))}\n\n`;
 
             if (transactions.length === 0) {
                 message += `Nenhuma transação encontrada\\.`;

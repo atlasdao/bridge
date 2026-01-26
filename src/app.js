@@ -3,6 +3,7 @@ const logger = require('./core/logger');
 const { Telegraf } = require('telegraf');
 const express = require('express');
 const https = require('https');
+const { SocksProxyAgent } = require('socks-proxy-agent');
 const { Pool } = require('pg');
 const IORedis = require('ioredis');
 const { registerBotHandlers } = require('./bot/handlers');
@@ -49,18 +50,26 @@ const mainRedisConnection = new IORedis({
 mainRedisConnection.on('connect', () => logger.info(`Main Redis connection successful to DB ${config.redis.db}.`));
 mainRedisConnection.on('error', (err) => logger.error(`Main Redis connection error to DB ${config.redis.db}:`, err.message));
 
-const httpsAgent = new https.Agent({
-    keepAlive: true,
-    family: 4,
-    rejectUnauthorized: true,
-    timeout: 30000
-});
+// Use Tor proxy for Telegram connection if available (required in some networks)
+let telegramAgent;
+if (config.tor.socksProxy) {
+    telegramAgent = new SocksProxyAgent(config.tor.socksProxy);
+    logger.info(`Telegram Bot configured to use Tor proxy: ${config.tor.socksProxy}`);
+} else {
+    telegramAgent = new https.Agent({
+        keepAlive: true,
+        family: 4,
+        rejectUnauthorized: true,
+        timeout: 30000
+    });
+    logger.info('Telegram Bot configured WITHOUT Tor proxy.');
+}
 
 const bot = new Telegraf(config.telegram.botToken, {
     telegram: {
         apiRoot: 'https://api.telegram.org',
         webhookReply: false,
-        agent: httpsAgent,
+        agent: telegramAgent,
         apiMode: 'bot'
     },
     handlerTimeout: 90000

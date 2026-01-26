@@ -21,7 +21,7 @@ const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expira
     const blockchainTxID = webhookData.blockchainTxID || null;
     const payerCpfCnpj = webhookData.payerTaxNumber || null;
     const payerName = webhookData.payerName || null;
-    const euid = webhookData.euid || null;
+    const euid = webhookData.payerEUID || null;
 
     if (!qrId) {
         logger.error('[Process] Missing qrId in webhook data.');
@@ -285,7 +285,7 @@ const processWebhook = async (webhookData, dbPool, bot, expectationQueue, expira
  */
 const processVerificationWebhook = async (verification, webhookData, dbPool, bot) => {
     const { verification_id, telegram_user_id, verification_status } = verification;
-    const { status, payerTaxNumber, payerName: webhookPayerName, euid } = webhookData;
+    const { status, payerTaxNumber, payerName: webhookPayerName, payerEUID: euid } = webhookData;
 
     logger.info(`[ProcessVerification] Processing verification ${verification_id} with status ${status}, payer data: ${JSON.stringify({payerTaxNumber, payerName: webhookPayerName})}`);
 
