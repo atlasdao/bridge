@@ -55,7 +55,7 @@ O desenvolvimento do Atlas Bridge é contínuo. As funcionalidades planejadas pa
 
 O Atlas Bridge é um projeto orientado pela comunidade. Encorajamos a participação ativa em todas as frentes:
 
-*   **Comunidade Telegram:** Junte-se ao nosso grupo principal para discussões, suporte, e para acompanhar o desenvolvimento: [https://t.me/+x0no8ursVlZhOTI5](https://t.me/+x0no8ursVlZhOTI5)
+*   **Comunidade Telegram:** Junte-se ao nosso grupo principal para discussões, suporte, e para acompanhar o desenvolvimento: [https://t.me/atlasdao_comunidade](https://t.me/atlasdao_comunidade)
 *   **Desenvolvimento de Código:** Contribuições para o código fonte são bem-vindas. Consulte o repositório GitHub, verifique as *Issues* abertas ou proponha novas melhorias através de *Pull Requests*.
 *   **Relato de Bugs e Sugestões:** Utilize a seção de *Issues* do repositório GitHub para relatar problemas ou sugerir novas funcionalidades.
 *   **Outras Formas de Contribuição:** Ideias, feedback, design, marketing, documentação e apoio financeiro são formas valiosas de contribuir para o avanço do projeto.
@@ -64,8 +64,20 @@ O Atlas Bridge é um projeto orientado pela comunidade. Encorajamos a participa�
 
 A Atlas DAO opera como uma Organização Autônoma Descentralizada. O financiamento para o desenvolvimento, manutenção da infraestrutura e custos operacionais depende primariamente de doações da comunidade.
 
-*   **Endereço Liquid para doações (DePix ou L-BTC):**
-    `VJLBCUaw6GL8AuyjsrwpwTYNCUfUxPVTfxxffNTEZMKEjSwamWL6YqUUWLvz89ts1scTDKYoTF8oruMX`
+Operamos a preço de custo, cobrando apenas 0,99 centavos por transação, não temos lucro com isso. Nossos servidores e desenvolvimento custa mensalmente cerca de 500-700 Depix, e estamos precisando aumentar e contratar mais 2 servidores.
+
+Eu estou trabalhando full-time na Atlas e também investindo do meu próprio capital para tornar esse projeto realidade.
+
+Se puder, contribua para manter os serviços funcionando:
+
+Depix lightning: atlasdao@joltz.app
+Depix ou L-BTC Liquid: lq1qq2t8qnrltevktgm3csjtk92tvmgewh0pe3um4py8xq3e95rh7reyculcencwtdn070fu6ep0c6xfq8l884fg5rjgm0nsr8vd8
+
+Bitcoin lightning ou on-chain: https://coinos.io/AtlasDAO
+
+Doe com Monero: 88wDjgGk43PP9EpSQmYR5Kd3jRYwXyCKRS2gk17HxuhH3jWprumjUrYBcNGTdvMLUxJLFdzrpUkWWSsP9rB7spTYDrcp9WY
+
+Doe com USDT ou USDC EVM: 0xbebc3fabfc17de89d6b80d6beb136002be17d310
 
 ## Licença
 
