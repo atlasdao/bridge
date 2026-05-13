@@ -70,7 +70,6 @@ Eu estou trabalhando full-time na Atlas e também investindo do meu próprio cap
 
 Se puder, contribua para manter os serviços funcionando:
 
-Depix lightning: atlasdao@joltz.app
 Depix ou L-BTC Liquid: lq1qq2t8qnrltevktgm3csjtk92tvmgewh0pe3um4py8xq3e95rh7reyculcencwtdn070fu6ep0c6xfq8l884fg5rjgm0nsr8vd8
 
 Bitcoin lightning ou on-chain: https://coinos.io/AtlasDAO
